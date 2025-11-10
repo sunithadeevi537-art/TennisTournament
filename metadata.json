@@ -1,0 +1,7 @@
+{
+  "name": "Tournament Manager",
+  "description": "A web application for managing tennis, pickleball, and other tournaments, allowing player data upload, automatic grouping, fixture generation, payment tracking via QR, and real-time score and ranking updates.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
