@@ -1,3 +1,4 @@
+
 import React from 'react';
 // Fix: The 'types.ts' file was a placeholder, causing "is not a module" error.
 // The content of 'types.ts' has been updated to include proper exports, resolving this import issue.
@@ -23,7 +24,7 @@ const Rankings: React.FC<RankingsProps> = ({ players }) => {
             <tr>
               <th className="py-2 px-4 border-b-2 text-left text-gray-600 font-semibold">Rank</th>
               <th className="py-2 px-4 border-b-2 text-left text-gray-600 font-semibold">Player</th>
-              <th className="py-2 px-4 border-b-2 text-left text-gray-600 font-semibold">Category</th> {/* Changed from Rating */}
+              <th className="py-2 px-4 border-b-2 text-left text-gray-600 font-semibold">Rating</th> {/* Changed from Category */}
             </tr>
           </thead>
           <tbody>
@@ -36,7 +37,7 @@ const Rankings: React.FC<RankingsProps> = ({ players }) => {
                   )}
                   {player.name}
                 </td>
-                <td className="py-2 px-4 border-b">{player.category}</td> {/* Changed from player.rating */}
+                <td className="py-2 px-4 border-b">{Math.round(player.rating)}</td> {/* Changed from player.category */}
               </tr>
             ))}
           </tbody>

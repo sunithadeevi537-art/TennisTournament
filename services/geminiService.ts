@@ -1,114 +1,69 @@
-import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai"; // Added Type for responseSchema
-import { GEMINI_MODEL_TEXT } from "../constants";
-// Fix: The 'types.ts' file was a placeholder, causing "is not a module" error.
-// The content of 'types.ts' has been updated to include proper exports, resolving this import issue.
-import { Player, Match } from "../types";
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
+import { GEMINI_MODEL_TEXT } from '../constants';
+import { Player, CsvMatch } from '../types';
+
+// Initialize the GoogleGenAI client with the API key from environment variables.
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 /**
- * Generates a summary for a tournament round using the Google Gemini API.
- * Always creates a new GoogleGenAI instance right before making an API call
- * to ensure it always uses the most up-to-date API key from the dialog,
- * as per `@google/genai` guidelines.
- *
- * @param players The list of players in the tournament.
- * @param matches The list of all matches, from which current round matches are filtered.
- * @param currentRound The current round number to summarize.
- * @returns A promise that resolves to the generated round summary text.
+ * Generates an exciting and concise summary for the given round of matches.
  */
 export async function generateRoundSummary(
-  players: Player[],
-  matches: Match[],
   currentRound: number,
+  matches: CsvMatch[],
+  players: Player[]
 ): Promise<string> {
-  // Always use `const ai = new GoogleGenAI({apiKey: process.env.API_KEY});`
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-  const roundMatches = matches.filter(match => match.round === currentRound);
-
-  const matchDetails = roundMatches.map(match => {
-    const player1 = players.find(p => p.id === match.player1Id);
-    const player2 = players.find(p => p.id === match.player2Id);
-    const winner = match.winnerId ? players.find(p => p.id === match.winnerId) : null;
-
-    return `Match ${match.id}: ${player1?.name} (${match.score1}) vs ${player2?.name} (${match.score2}). Winner: ${winner?.name || 'Draw'}.`;
+  const playerMap = new Map(players.map(p => [p.id, p]));
+  const matchDetails = matches.map(match => {
+    // Attempt to get player names from the full player list using IDs
+    const player1Name = playerMap.get(match.player1)?.name || match.player1; // Fallback to match.player1 if ID lookup fails
+    const player2Name = playerMap.find(p => p.id === match.player2)?.name || match.player2; // Fix: Use find for player2, and then .name
+    const categoryDetail = match.category ? ` in ${match.category} category` : '';
+    const groupDetail = match.group ? ` (Group: ${match.group})` : '';
+    return `- ${player1Name} vs ${player2Name}${categoryDetail}${groupDetail}`;
   }).join('\n');
 
-  const playerRatings = players.map(p => `${p.name} (Rating: ${Math.round(p.rating)}, Wins: ${p.wins}, Losses: ${p.losses}, Draws: ${p.draws}, Category: ${p.category})`).join('\n');
-
-  const prompt = `
-  You are an AI assistant for a tournament.
-  Please summarize the completed Round ${currentRound} of the tournament based on the following information.
-  Identify key highlights, close matches, surprising results, and top performers.
-  Also, provide a brief analysis of the current player standings based on their ratings and win/loss/draw records.
-  Finally, offer a prediction or interesting insight for the next round or the tournament as a whole.
-
-  Round ${currentRound} Matches:
-  ${matchDetails}
-
-  Current Player Standings:
-  ${playerRatings}
-
-  Keep the summary concise and engaging, suitable for an announcement to participants.
-  Focus on the most impactful events and player performances.
-  `;
+  const prompt = `You are a professional sports commentator. Provide an exciting and concise summary for Round ${currentRound} of the tournament.
+Here are the matches that took place in this round:\n${matchDetails}\n
+Focus on key matchups, close calls, and notable performances. Keep it under 200 words.`;
 
   try {
     const response: GenerateContentResponse = await ai.models.generateContent({
       model: GEMINI_MODEL_TEXT,
-      contents: [{ text: prompt }], // Ensure contents is an array of parts
+      contents: [{ parts: [{ text: prompt }] }],
     });
-    // Extracting text output directly from the response object
-    return response.text;
+    return response.text.trim();
   } catch (error) {
-    console.error("Error generating round summary:", error);
-    // Implement robust handling for API errors (e.g., 4xx/5xx) and unexpected responses.
-    // Graceful retry logic (like exponential backoff) is recommended in a real app.
-    // For now, return a default error message.
-    return "Failed to generate round summary. Please try again.";
+    console.error('Error generating round summary:', error);
+    return 'Failed to generate round summary.';
   }
 }
 
 /**
- * Generates a JSON string for a player's QR code,
- * containing essential player identification data.
- * @param player The player object.
- * @returns A JSON string representing the player's QR data.
+ * Generates a complete single round-robin fixture for a given category of players.
  */
-export function generatePlayerQRData(player: Player): string {
-  // Encode player ID, mobile number, and category to identify the player uniquely
-  return JSON.stringify({ id: player.id, mobile: player.mobileNumber, category: player.category });
-}
-
-
-/**
- * Generates a complete round-robin fixture (all unique pairings) for a given category and optional group of players
- * using the Google Gemini API.
- * @param players The list of players in the specific category/group.
- * @param category The category name for which to generate the fixture.
- * @param group Optional group name within the category.
- * @returns A promise that resolves to an array of objects, each containing player1 and player2 names.
- */
-export async function generateCategoryFixtureWithGemini(
+// Fix: Add `round: number` to the responseSchema for generateRoundRobinFixture to align with CsvMatch.
+export async function generateRoundRobinFixture(
   players: Player[],
   category: string,
-  group?: string,
-): Promise<{ player1: string; player2: string; category: string; group?: string; }[]> {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+): Promise<CsvMatch[]> { // Change return type to CsvMatch[]
+  const categoryPlayers = players.filter(p => p.category === category);
+  if (categoryPlayers.length < 2) {
+    throw new Error('Need at least two players to generate a round-robin fixture.');
+  }
 
-  const playerNames = players.map(p => p.name);
-  const groupText = group ? ` for Group '${group}'` : '';
+  const prompt = `Generate a complete single round-robin fixture for the following players in the '${category}' category.
+Ensure every player plays against every other player exactly once.
+Provide the output as a JSON array of objects, where each object has 'player1' (player name), 'player2' (player name), 'category' (string), and 'round' (number, always 1 for this initial fixture) fields.
+The player names must exactly match the provided list.
 
-  const prompt = `
-  You are an AI assistant that generates round-robin tournament fixtures.
-  Generate a complete round-robin fixture for the '${category}' category${groupText} with the following players: ${playerNames.join(', ')}.
-  Provide the output as a JSON array where each element is an object with 'player1', 'player2', 'category', and optionally 'group' properties, representing a unique match pairing.
-  Ensure every player plays every other player exactly once within their group/category.
-  `;
+Players in '${category}' category: ${categoryPlayers.map(p => p.name).join(', ')}
+`;
 
   try {
     const response: GenerateContentResponse = await ai.models.generateContent({
       model: GEMINI_MODEL_TEXT,
-      contents: [{ text: prompt }],
+      contents: [{ parts: [{ text: prompt }] }],
       config: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -116,160 +71,173 @@ export async function generateCategoryFixtureWithGemini(
           items: {
             type: Type.OBJECT,
             properties: {
-              player1: {
-                type: Type.STRING,
-                description: 'The name of the first player in the match.',
-              },
-              player2: {
-                type: Type.STRING,
-                description: 'The name of the second player in the match.',
-              },
-              category: {
-                type: Type.STRING,
-                description: 'The category of the players in the match.',
-              },
-              group: { // Optional group field
-                type: Type.STRING,
-                description: 'The group of the players in the match (if applicable).',
-              },
+              player1: { type: Type.STRING, description: 'Name of the first player' },
+              player2: { type: Type.STRING, description: 'Name of the second player' },
+              category: { type: Type.STRING, description: 'Category of the match' },
+              round: { type: Type.INTEGER, description: 'Round number, always 1 for this fixture' }, // Added round
             },
-            propertyOrdering: ["player1", "player2", "category", "group"],
-            required: ["player1", "player2", "category"],
+            required: ['player1', 'player2', 'category', 'round'], // Added round
+            propertyOrdering: ['player1', 'player2', 'category', 'round'], // Added round
           },
         },
       },
     });
 
-    const jsonStr = response.text.trim();
-    // Basic validation to ensure it's an array before parsing
-    if (jsonStr.startsWith('[') && jsonStr.endsWith(']')) {
-      const fixtureData = JSON.parse(jsonStr);
-      // Ensure all items in the fixture have the correct category and group if present
-      return fixtureData.map((match: any) => ({ ...match, category, group }));
-    } else {
-      console.error("Gemini did not return a valid JSON array for fixture:", jsonStr);
-      throw new Error("Invalid JSON response for fixture generation.");
+    let jsonStr = response.text.trim();
+    // Fix: Sometimes the model might include markdown backticks. Remove them.
+    if (jsonStr.startsWith('```json')) {
+      jsonStr = jsonStr.substring(7);
     }
+    if (jsonStr.endsWith('```')) {
+      jsonStr = jsonStr.substring(0, jsonStr.length - 3);
+    }
+
+    const fixture: CsvMatch[] = JSON.parse(jsonStr); // Cast to CsvMatch[]
+
+    // Basic validation to ensure all players are included and no duplicates
+    const generatedPlayerNames = new Set<string>();
+    fixture.forEach((match: CsvMatch) => { // Use CsvMatch type
+      generatedPlayerNames.add(match.player1);
+      generatedPlayerNames.add(match.player2);
+    });
+
+    const providedPlayerNames = new Set(categoryPlayers.map(p => p.name));
+    const missingPlayers = Array.from(providedPlayerNames).filter(name => !generatedPlayerNames.has(name));
+    if (missingPlayers.length > 0) {
+      console.warn(`Generated fixture for ${category} might be incomplete, missing players: ${missingPlayers.join(', ')}`);
+      // Optionally, throw an error or attempt regeneration for stricter validation.
+    }
+
+    return fixture;
   } catch (error) {
-    console.error(`Error generating fixture for category ${category}:`, error);
-    return []; // Return empty array on error
+    console.error(`Error generating round-robin fixture for category ${category}:`, error);
+    throw new Error(`Failed to generate round-robin fixture for ${category}. Ensure players are unique and sufficient. Error: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 /**
- * Placeholder for generating groups for a hybrid tournament using Gemini.
- * This function is intended to take a list of players for a category and divide them into balanced groups.
- * (Note: Complex grouping logic for 'min 4 players per group' is more reliably done client-side.
- * Gemini can be used for balancing or creative naming, but strict numerical constraints are hard for LLMs).
- * For now, this will return a simplified structure or an empty array.
+ * Generates groups and round-robin fixtures for a hybrid tournament format.
+ * Returns an object with generated groups (Player[][]) and fixtures (CsvMatch[][]),
+ * keyed by a unique identifier for the category/group.
  */
-export async function generateHybridGroupsWithGemini(
-  players: Player[],
+// Fix: Adjust the type of `fixtures` in the returned object and ensure `round` is included in generated matches.
+export async function generateHybridGroupsAndFixtures(
+  allPlayers: Player[],
   category: string,
   minPlayersPerGroup: number,
-): Promise<Player[][]> {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const playerNames = players.map(p => p.name);
+): Promise<{ groups: Player[][]; fixtures: Record<string, CsvMatch[]> }> { // Return type adjusted
+  const categoryPlayers = allPlayers.filter(p => p.category === category);
 
-  const prompt = `
-  You are an AI assistant for a hybrid tournament setup.
-  Given ${players.length} players in the '${category}' category: ${playerNames.join(', ')}.
-  Divide these players into groups, with a minimum of ${minPlayersPerGroup} players per group.
-  The goal is to create as balanced groups as possible.
-  Provide the output as a JSON array of arrays, where each inner array represents a group of player names.
-  Example: [["PlayerA", "PlayerB", "PlayerC"], ["PlayerD", "PlayerE", "PlayerF"]]
-  `;
-
-  try {
-    const response: GenerateContentResponse = await ai.models.generateContent({
-      model: GEMINI_MODEL_TEXT,
-      contents: [{ text: prompt }],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-          },
-        },
-      },
-    });
-
-    const jsonStr = response.text.trim();
-    if (jsonStr.startsWith('[') && jsonStr.endsWith(']')) {
-      const groupsOfNames: string[][] = JSON.parse(jsonStr);
-      // Map names back to player objects
-      const groupedPlayers: Player[][] = groupsOfNames.map(groupNames =>
-        groupNames.map(name => players.find(p => p.name === name)).filter((p): p is Player => p !== undefined)
-      );
-      // Basic validation: ensure groups meet min size (Gemini might not strictly adhere)
-      const validGroups = groupedPlayers.filter(group => group.length >= minPlayersPerGroup);
-      if (validGroups.length < groupedPlayers.length) {
-        console.warn("Gemini-generated groups did not all meet minimum player count. Returning only valid groups.");
-      }
-      return validGroups;
-
-    } else {
-      console.error("Gemini did not return a valid JSON array of arrays for groups:", jsonStr);
-      throw new Error("Invalid JSON response for hybrid group generation.");
-    }
-  } catch (error) {
-    console.error(`Error generating hybrid groups for category ${category}:`, error);
-    return [];
+  if (categoryPlayers.length < minPlayersPerGroup) {
+    // If not enough players for grouping, treat as a single group and generate one RR fixture.
+    console.log(`Not enough players (${categoryPlayers.length}) in ${category} for multiple groups (min: ${minPlayersPerGroup}). Generating single RR fixture.`);
+    const fixture = await generateRoundRobinFixture(categoryPlayers, category); // This now returns CsvMatch[]
+    return {
+      groups: [categoryPlayers],
+      fixtures: { [`${category}-Group-1`]: fixture.map(m => ({ ...m, group: 'Group 1' })) }
+    };
   }
-}
 
-/**
- * Placeholder for generating a knockout bracket from a list of players (e.g., group winners).
- */
-export async function generateKnockoutBracketWithGemini(
-  players: Player[],
-  category?: string,
-): Promise<{ player1: string; player2: string; category?: string; }[]> {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const playerNames = players.map(p => p.name);
+  // Heuristic for number of groups: aim for groups of ~minPlayersPerGroup up to 8 players (common for RR),
+  // but ensure at least 2 groups if there are enough players.
+  const idealGroupSize = Math.max(minPlayersPerGroup, Math.min(8, Math.ceil(categoryPlayers.length / 2)));
+  let numberOfGroups = Math.max(1, Math.round(categoryPlayers.length / idealGroupSize));
+  // Ensure we don't create too many groups if there are few players,
+  // and each group meets the minPlayersPerGroup criteria.
+  if (categoryPlayers.length / numberOfGroups < minPlayersPerGroup) {
+    numberOfGroups = Math.floor(categoryPlayers.length / minPlayersPerGroup);
+    if (numberOfGroups === 0) numberOfGroups = 1; // Fallback to 1 group if it can't meet min criteria even with all players
+  }
+  numberOfGroups = Math.max(1, numberOfGroups); // Ensure at least one group
 
-  const prompt = `
-  You are an AI assistant that generates knockout tournament brackets.
-  Given the following players${category ? ` in the '${category}' category` : ''}: ${playerNames.join(', ')}.
-  Generate the pairings for the first round of a knockout tournament.
-  Provide the output as a JSON array where each element is an object with 'player1' and 'player2' properties.
-  Ensure there are unique pairings suitable for a knockout format.
-  `;
+  const prompt = `For the '${category}' category, divide the following players into ${numberOfGroups} groups for an initial round-robin stage.
+Each group should have at least ${minPlayersPerGroup} players. After grouping, generate a complete single round-robin fixture for each group.
+Ensure every player within a group plays against every other player in that group exactly once.
+The output should be a JSON object with two main properties: 'groups' and 'fixtures'.
+'groups' should be an array of arrays, where each inner array represents a group and contains player names (string).
+'fixtures' should be an object where keys are group identifiers (e.g., "Group 1", "Group 2") and values are arrays of match objects.
+Each match object should have 'player1' (player name), 'player2' (player name), 'category' (string), 'group' (string), and 'round' (number, always 1 for this stage) fields.
+The player names in the output must exactly match the provided list.
+
+Players in '${category}' category: ${categoryPlayers.map(p => p.name).join(', ')}
+Minimum players per group: ${minPlayersPerGroup}
+Number of groups to aim for: ${numberOfGroups} (adjust if needed to meet minPlayersPerGroup criteria)
+`;
 
   try {
     const response: GenerateContentResponse = await ai.models.generateContent({
       model: GEMINI_MODEL_TEXT,
-      contents: [{ text: prompt }],
+      contents: [{ parts: [{ text: prompt }] }],
       config: {
         responseMimeType: "application/json",
         responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              player1: { type: Type.STRING },
-              player2: { type: Type.STRING },
-              category: { type: Type.STRING },
+          type: Type.OBJECT,
+          properties: {
+            groups: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING, description: 'Player name' },
+              },
+              description: 'Array of player groups, each containing player names',
             },
-            propertyOrdering: ["player1", "player2", "category"],
-            required: ["player1", "player2"],
+            fixtures: {
+              type: Type.OBJECT,
+              additionalProperties: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    player1: { type: Type.STRING, description: 'Name of the first player' },
+                    player2: { type: Type.STRING, description: 'Name of the second player' },
+                    category: { type: Type.STRING, description: 'Category of the match' },
+                    group: { type: Type.STRING, description: 'Group identifier (e.g., "Group 1")' },
+                    // Fix: Add 'round' to the responseSchema for consistency with CsvMatch
+                    round: { type: Type.INTEGER, description: 'Round number, always 1 for this fixture' },
+                  },
+                  // Fix: Add 'round' to the required properties for consistency
+                  required: ['player1', 'player2', 'category', 'group', 'round'],
+                  // Fix: Add 'round' to propertyOrdering for consistency
+                  propertyOrdering: ['player1', 'player2', 'category', 'group', 'round'],
+                },
+              },
+              description: 'Object of fixtures, keyed by group identifier',
+            },
           },
+          required: ['groups', 'fixtures'],
+          propertyOrdering: ['groups', 'fixtures'],
         },
       },
     });
 
-    const jsonStr = response.text.trim();
-    if (jsonStr.startsWith('[') && jsonStr.endsWith(']')) {
-      const bracketData = JSON.parse(jsonStr);
-      return bracketData.map((match: any) => ({ ...match, category }));
-    } else {
-      console.error("Gemini did not return a valid JSON array for knockout bracket:", jsonStr);
-      throw new Error("Invalid JSON response for knockout bracket generation.");
+    let jsonStr = response.text.trim();
+    // Fix: Sometimes the model might include markdown backticks. Remove them.
+    if (jsonStr.startsWith('```json')) {
+      jsonStr = jsonStr.substring(7);
     }
+    if (jsonStr.endsWith('```')) {
+      jsonStr = jsonStr.substring(0, jsonStr.length - 3);
+    }
+
+    const result: { groups: string[][]; fixtures: Record<string, CsvMatch[]> } = JSON.parse(jsonStr); // Cast to CsvMatch[]
+
+    // Map player names back to Player objects
+    const groupsAsPlayers: Player[][] = result.groups.map(groupNames =>
+      groupNames.map(name => {
+        const player = allPlayers.find(p => p.name === name);
+        if (!player) {
+          console.warn(`Player "${name}" not found when reconstructing groups for category ${category}.`);
+          // Create a placeholder player to prevent app crash, or handle as a stricter error.
+          return { id: `unknown-${name}-${Date.now()}`, name: name, mobileNumber: '', rating: 0, wins: 0, losses: 0, draws: 0, category: category };
+        }
+        return player;
+      })
+    );
+
+    return { groups: groupsAsPlayers, fixtures: result.fixtures };
+
   } catch (error) {
-    console.error(`Error generating knockout bracket for category ${category}:`, error);
-    return [];
+    console.error(`Error generating hybrid groups and fixtures for category ${category}:`, error);
+    throw new Error(`Failed to generate hybrid groups and fixtures for ${category}. Error: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

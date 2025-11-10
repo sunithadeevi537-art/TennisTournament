@@ -60,12 +60,16 @@ export interface TournamentState {
   isAdminLoggedIn: boolean;
   currentMode: 'admin' | 'user';
   activeFixtureCategories: string[]; // For Round Robin, tracks which categories have matches added to tournament
-  generatedFixtures: Record<string, { player1: string; player2: string; category?: string; group?: string; }[]>; // New: Store generated fixtures by category
+  // Fix: Updated type to CsvMatch[] to include 'round' property explicitly.
+  generatedFixtures: Record<string, CsvMatch[]>; // New: Store generated fixtures by category
   isGeneratingFixture: Record<string, boolean>; // New: Track loading state per category
   generatedHybridGroups: Record<string, Player[][]>; // New: Store generated groups for hybrid (e.g., category -> array of groups)
   isGeneratingHybridGroups: Record<string, boolean>; // New: Track loading for hybrid groups
-  publishedFixtures: Record<string, { player1: string; player2: string; category?: string; group?: string; }[]>; // New: Stores fixtures published to player portal
+  // Fix: Updated type to CsvMatch[] to include 'round' property explicitly.
+  publishedFixtures: Record<string, CsvMatch[]>; // New: Stores fixtures published to player portal
   isBulkUploadingPlayers: boolean; // New: track loading state for CSV player upload
+  // Fix: Added isLoadingSummary to TournamentState.
+  isLoadingSummary: boolean;
 }
 
 // Interface for bulk player upload from CSV
@@ -74,6 +78,7 @@ export interface CsvPlayer {
   mobileNumber: string;
   rating?: number;
   category?: string;
+  imageUrl?: string; // Fix: Added imageUrl to CsvPlayer
 }
 
 // New interface for custom fixture upload from CSV

@@ -14,7 +14,7 @@ interface PlayerListProps {
   onBulkUploadPlayers: (file: File) => void;
   isAdminMode: boolean;
   isBulkUploadingPlayers: boolean;
-  onScanPlayerQR: () => void; // Added for QR scanner integration
+  // onScanPlayerQR: () => void; // Removed for QR scanner integration
 }
 
 const PlayerList: React.FC<PlayerListProps> = ({
@@ -25,7 +25,7 @@ const PlayerList: React.FC<PlayerListProps> = ({
   onBulkUploadPlayers,
   isAdminMode,
   isBulkUploadingPlayers,
-  onScanPlayerQR,
+  // onScanPlayerQR, // Removed
 }) => {
   const [showAddPlayerForm, setShowAddPlayerForm] = useState(false);
   const [newPlayerName, setNewPlayerName] = useState('');
@@ -125,9 +125,9 @@ const PlayerList: React.FC<PlayerListProps> = ({
           <p className="text-sm text-gray-500">
             CSV should have columns: <code>name,mobileNumber,rating,category</code>
           </p>
-          <Button onClick={onScanPlayerQR} variant="secondary" className="w-full">
+          {/* <Button onClick={onScanPlayerQR} variant="secondary" className="w-full">
             Scan QR to Register Player
-          </Button>
+          </Button> */}
         </div>
       )}
 

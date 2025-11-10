@@ -36,7 +36,8 @@ interface TournamentSetupProps {
   isGeneratingHybridGroups: Record<string, boolean>;
   onGenerateHybridFixtures: (category: string) => void;
   onUploadCustomFixture: (file: File) => void; // For custom fixture upload
-  onAddHybridFixtureMatchesToTournament: (fixture: CsvMatch[]) => void;
+  // Fix: Renamed the prop to match the usage in App.tsx
+  onAddHybridFixtureMatchesToTournamentProp: (fixture: CsvMatch[]) => void;
   onPublishFixture: (categoryKey: string) => void; // New prop: to publish fixture
   isFixturePublished: (categoryKey: string) => boolean; // New prop: check if fixture is published
 }
@@ -66,7 +67,7 @@ const TournamentSetup: React.FC<TournamentSetupProps> = ({
   isGeneratingHybridGroups,
   onGenerateHybridFixtures,
   onUploadCustomFixture,
-  onAddHybridFixtureMatchesToTournament: onAddHybridFixtureMatchesToTournamentProp, // Renamed to avoid conflict
+  onAddHybridFixtureMatchesToTournamentProp, // Renamed to avoid conflict
   onPublishFixture, // New
   isFixturePublished, // New
 }) => {

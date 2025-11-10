@@ -2,13 +2,15 @@ import React, { useRef } from 'react';
 import Button from './Button'; // Assuming Button component exists
 
 interface FileUploadProps {
+  children?: React.ReactNode; // Added children to allow more flexible button content
   onFileSelect: (file: File) => void;
   acceptedFileTypes?: string;
   buttonText?: string;
-  isDisabled?: boolean; // New prop to disable upload
+  isDisabled?: boolean;
+  className?: string; // New: Added className prop
 }
 
-const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, acceptedFileTypes = "image/*", buttonText = "Upload File", isDisabled = false }) => {
+const FileUpload: React.FC<FileUploadProps> = ({ children, onFileSelect, acceptedFileTypes = "image/*", buttonText = "Upload File", isDisabled = false, className }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -28,7 +30,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, acceptedFileTypes
   };
 
   return (
-    <div className="flex items-center space-x-2">
+    <div className={`flex items-center space-x-2 ${className}`}>
       <input
         id="file-upload"
         name="file-upload"
@@ -40,7 +42,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, acceptedFileTypes
         disabled={isDisabled}
       />
       <Button onClick={handleButtonClick} variant="secondary" disabled={isDisabled}>
-        {buttonText}
+        {children || buttonText}
       </Button>
       <span className="text-gray-600 text-sm"></span>
     </div>

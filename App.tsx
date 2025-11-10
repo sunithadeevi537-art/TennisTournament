@@ -1,1331 +1,1162 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { v4 as uuidv4 } from 'uuid';
-import Papa from 'papaparse'; // Switched to PapaParse
-import html2canvas from 'html2canvas';
+// A simple ID generator as uuidv4 might require a new NPM dependency, which is disallowed.
+// If uuid is available, it's preferred.
+// For this context, we will use a simple, non-cryptographic unique ID generator.
+let currentId = 0;
+function generateUniqueId(): string {
+  currentId++;
+  return `id_${currentId}_${Date.now()}`;
+}
 
+// Components
 import Header from './components/Header';
 import PlayerList from './components/PlayerList';
 import TournamentSetup from './components/TournamentSetup';
 import MatchSchedule from './components/MatchSchedule';
 import Rankings from './components/Rankings';
-import QRScanner from './components/QRScanner';
 import LoginModal from './components/LoginModal';
+import QRScanner from './components/QRScanner'; // Assuming QR scanner integration for future
+// Fix: Added import for Button component
+import Button from './components/Button';
+
+// Types & Constants
 import {
   Player,
   Match,
   TournamentState,
   TournamentSettings,
-  TournamentType,
   MatchFormat,
+  TournamentType,
   CsvPlayer,
-  CsvMatch
+  CsvMatch,
 } from './types';
 import {
   TOURNAMENT_APP_STORAGE_KEY,
+  PLAYER_CATEGORIES,
   DEFAULT_PLAYER_CATEGORY,
   DEFAULT_TOURNAMENT_TYPE,
+  MATCH_FORMATS,
   DEFAULT_MIN_PLAYERS_PER_HYBRID_GROUP,
-  PLAYER_CATEGORIES
 } from './constants';
+
+// Services
 import {
   generateRoundSummary,
-  generatePlayerQRData,
-  generateCategoryFixtureWithGemini,
-  generateHybridGroupsWithGemini,
-  generateKnockoutBracketWithGemini
+  generateRoundRobinFixture,
+  generateHybridGroupsAndFixtures,
 } from './services/geminiService';
-import Button from './components/Button';
-import Card from './components/Card';
 
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password';
+// External libraries
+import html2canvas from 'html2canvas';
+import Papa from 'papaparse'; // Fix: Import PapaParse
+
+
+// Initial state for the tournament application
+const initialState: TournamentState = {
+  players: [],
+  matches: [],
+  currentRound: 0,
+  tournamentSettings: null,
+  roundSummaries: {},
+  isAdminLoggedIn: false,
+  currentMode: 'user', // Default to user mode
+  activeFixtureCategories: [], // Track categories where fixtures have been added
+  generatedFixtures: {}, // Stores generated RR fixtures by category or hybrid group key
+  isGeneratingFixture: {}, // Tracks loading state for RR fixture generation
+  generatedHybridGroups: {}, // Stores generated groups for hybrid (e.g., category -> array of groups)
+  isGeneratingHybridGroups: {}, // Tracks loading state for hybrid group/fixture generation
+  publishedFixtures: {}, // Stores fixtures published to player portal
+  isBulkUploadingPlayers: false, // New: track loading state for CSV player upload
+  // Fix: Initialized isLoadingSummary
+  isLoadingSummary: false,
+};
 
 const App: React.FC = () => {
-  const [state, setState] = useState<TournamentState>(() => {
-    const savedState = localStorage.getItem(TOURNAMENT_APP_STORAGE_KEY);
-    if (savedState) {
+  // State management
+  const [tournamentState, setTournamentState] = useState<TournamentState>(() => {
+    const storedState = localStorage.getItem(TOURNAMENT_APP_STORAGE_KEY);
+    if (storedState) {
       try {
-        const parsedState: TournamentState = JSON.parse(savedState);
-        // Ensure that new fields are initialized if not present in saved state
-        return {
-          ...parsedState,
-          generatedFixtures: parsedState.generatedFixtures || {},
-          isGeneratingFixture: parsedState.isGeneratingFixture || {},
-          generatedHybridGroups: parsedState.generatedHybridGroups || {},
-          isGeneratingHybridGroups: parsedState.isGeneratingHybridGroups || {},
-          publishedFixtures: parsedState.publishedFixtures || {}, // New: Initialize publishedFixtures
-          isBulkUploadingPlayers: parsedState.isBulkUploadingPlayers || false, // New: Initialize bulk upload state
-          currentMode: parsedState.currentMode || 'user',
-        };
+        const parsedState: TournamentState = JSON.parse(storedState);
+        // Ensure that new fields are initialized if not present in localStorage
+        return { ...initialState, ...parsedState };
       } catch (e) {
-        console.error("Failed to parse stored state, starting fresh:", e);
+        console.error("Error parsing stored tournament state, using initial state:", e);
+        return initialState;
       }
     }
-    return {
-      players: [],
-      matches: [],
-      currentRound: 0,
-      tournamentSettings: null,
-      roundSummaries: {},
-      isAdminLoggedIn: false,
-      currentMode: 'user', // Default to user mode
-      activeFixtureCategories: [],
-      generatedFixtures: {},
-      isGeneratingFixture: {},
-      generatedHybridGroups: {},
-      isGeneratingHybridGroups: {},
-      publishedFixtures: {}, // New: Default empty
-      isBulkUploadingPlayers: false, // New: Default false
-    };
+    return initialState;
   });
 
-  const [showLoginModal, setShowLoginModal] = useState(false);
-  const [showQRScanner, setShowQRScanner] = useState(false);
-  const [selectedTournamentType, setSelectedTournamentType] = useState<TournamentType>(state.tournamentSettings?.tournamentType || DEFAULT_TOURNAMENT_TYPE);
-  const [selectedMatchFormat, setSelectedMatchFormat] = useState<MatchFormat>(state.tournamentSettings?.matchFormat || MatchFormat.Knockout);
-  const [minPlayersPerHybridGroup, setMinPlayersPerHybridGroup] = useState<number>(state.tournamentSettings?.minPlayersPerHybridGroup || DEFAULT_MIN_PLAYERS_PER_HYBRID_GROUP);
-  const [scanPurpose, setScanPurpose] = useState<'player_add_qr' | 'player_identify' | null>(null);
+  // Destructure for easier access
+  const {
+    players,
+    matches,
+    currentRound,
+    tournamentSettings,
+    roundSummaries,
+    isAdminLoggedIn,
+    currentMode,
+    activeFixtureCategories,
+    generatedFixtures,
+    isGeneratingFixture,
+    generatedHybridGroups,
+    isGeneratingHybridGroups,
+    publishedFixtures,
+    isBulkUploadingPlayers,
+  } = tournamentState;
 
+  // Persist state to localStorage on changes
   useEffect(() => {
-    localStorage.setItem(TOURNAMENT_APP_STORAGE_KEY, JSON.stringify(state));
-  }, [state]);
+    localStorage.setItem(TOURNAMENT_APP_STORAGE_KEY, JSON.stringify(tournamentState));
+  }, [tournamentState]);
 
-  const handleLoginSuccess = () => {
-    setState((prevState) => ({ ...prevState, isAdminLoggedIn: true, currentMode: 'admin' }));
+  // Login Modal
+  const [showLoginModal, setShowLoginModal] = useState(false);
+
+  const handleLoginSuccess = useCallback(() => {
+    setTournamentState((prev) => ({ ...prev, isAdminLoggedIn: true }));
     setShowLoginModal(false);
-  };
+  }, []);
 
-  const handleLogout = () => {
-    setState((prevState) => ({ ...prevState, isAdminLoggedIn: false, currentMode: 'user' }));
-  };
+  const handleLogout = useCallback(() => {
+    setTournamentState((prev) => ({ ...prev, isAdminLoggedIn: false }));
+  }, []);
 
-  const handleModeChange = (mode: 'admin' | 'user') => {
-    setState((prevState) => ({ ...prevState, currentMode: mode })); // Always set the mode
-    if (mode === 'admin' && !state.isAdminLoggedIn) {
+  // Mode switching
+  const handleModeChange = useCallback((mode: 'admin' | 'user') => {
+    if (mode === 'admin' && !isAdminLoggedIn) {
       setShowLoginModal(true);
+    } else {
+      setTournamentState((prev) => ({ ...prev, currentMode: mode }));
     }
-  };
+  }, [isAdminLoggedIn]);
 
-  const addPlayer = (name: string, mobileNumber: string, category: string, imageUrl?: string) => {
-    const newPlayer: Player = {
-      id: uuidv4(),
-      name,
-      mobileNumber,
-      rating: 1500, // Default rating
-      wins: 0,
-      losses: 0,
-      draws: 0,
-      category,
-      imageUrl,
-    };
-    // Generate QR data for the new player
-    newPlayer.qrData = generatePlayerQRData(newPlayer);
-    setState((prevState) => ({ ...prevState, players: [...prevState.players, newPlayer] }));
-  };
+  // Player Management
+  const handleAddPlayer = useCallback((name: string, mobileNumber: string, category: string, imageUrl?: string) => {
+    setTournamentState((prev) => {
+      const newPlayer: Player = {
+        id: generateUniqueId(),
+        name,
+        mobileNumber,
+        rating: 1500, // Default rating
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        category,
+        imageUrl,
+      };
+      return { ...prev, players: [...prev.players, newPlayer] };
+    });
+  }, []);
 
-  const deletePlayer = (id: string) => {
-    setState((prevState) => ({
-      ...prevState,
-      players: prevState.players.filter((player) => player.id !== id),
-      // Remove matches involving the deleted player
-      matches: prevState.matches.filter(
-        (match) => match.player1Id !== id && match.player2Id !== id,
-      ),
-      // Remove any generated fixtures or groups that might have included this player
-      generatedFixtures: Object.entries(prevState.generatedFixtures).reduce((acc, [cat, fixture]) => {
-        const typedFixture = fixture as Array<{ player1: string; player2: string; category?: string; group?: string; }>;
-        const filteredFixture = typedFixture.filter(
-          (m) =>
-            prevState.players.find(p => p.id === id)?.name !== m.player1 &&
-            prevState.players.find(p => p.id === id)?.name !== m.player2
+  const handleDeletePlayer = useCallback((id: string) => {
+    setTournamentState((prev) => {
+      // Also clean up any generated/published fixtures that might contain this player
+      const updatedGeneratedFixtures: Record<string, CsvMatch[]> = {};
+      Object.entries(prev.generatedFixtures).forEach(([key, fixture]) => {
+        // Fix: Ensure the filtered fixture maintains the CsvMatch type.
+        updatedGeneratedFixtures[key] = fixture.filter(
+          (match: CsvMatch) =>
+            prev.players.find(p => p.name === match.player1)?.id !== id &&
+            prev.players.find(p => p.name === match.player2)?.id !== id
         );
-        if (filteredFixture.length > 0) {
-          acc[cat] = filteredFixture;
-        }
-        return acc;
-      }, {} as Record<string, { player1: string; player2: string; category?: string; group?: string; }[]>),
-      generatedHybridGroups: Object.entries(prevState.generatedHybridGroups).reduce((acc, [cat, groups]) => {
-        const typedGroups = groups as Player[][];
-        // Filter out the player from groups
-        const filteredGroups = typedGroups.map(group =>
-          group.filter(p => p.id !== id)
-        ).filter(group => group.length > 0); // Remove empty groups
-        if (filteredGroups.length > 0) {
-          acc[cat] = filteredGroups;
-        }
-        return acc;
-      }, {} as Record<string, Player[][]>)
-    }));
-  };
+      });
 
-  const updatePlayer = (updatedPlayer: Player) => {
-    setState((prevState) => ({
-      ...prevState,
-      players: prevState.players.map((player) =>
-        player.id === updatedPlayer.id ? { ...updatedPlayer, qrData: generatePlayerQRData(updatedPlayer) } : player,
+      const updatedPublishedFixtures: Record<string, CsvMatch[]> = {};
+      Object.entries(prev.publishedFixtures).forEach(([key, fixture]) => {
+        // Fix: Ensure the filtered fixture maintains the CsvMatch type.
+        updatedPublishedFixtures[key] = fixture.filter(
+          (match: CsvMatch) =>
+            prev.players.find(p => p.name === match.player1)?.id !== id &&
+            prev.players.find(p => p.name === match.player2)?.id !== id
+        );
+      });
+
+      // Filter matches containing the deleted player
+      const updatedMatches = prev.matches.filter(
+        (match) => match.player1Id !== id && match.player2Id !== id
+      );
+
+      return {
+        ...prev,
+        players: prev.players.filter((player) => player.id !== id),
+        generatedFixtures: updatedGeneratedFixtures,
+        publishedFixtures: updatedPublishedFixtures,
+        matches: updatedMatches,
+      };
+    });
+  }, []);
+
+  const handleUpdatePlayer = useCallback((updatedPlayer: Player) => {
+    setTournamentState((prev) => ({
+      ...prev,
+      players: prev.players.map((player) =>
+        player.id === updatedPlayer.id ? updatedPlayer : player,
       ),
     }));
-  };
+  }, []);
 
-  const bulkUploadPlayers = useCallback((file: File) => {
-    console.log("bulkUploadPlayers: Function invoked with file:", file);
 
-    // Set loading state immediately
-    setState((prevState) => ({ ...prevState, isBulkUploadingPlayers: true }));
+  const handleBulkUploadPlayers = useCallback(async (file: File) => {
+    setTournamentState(prev => ({ ...prev, isBulkUploadingPlayers: true }));
+    // Fix: Declare processingErrors variable
+    let processingErrors: string[] = [];
+    let playersAddedCount = 0;
 
     try {
-      Papa.parse(file, {
-        header: true, // Expect a header row
+      const text = await file.text();
+      if (!text) {
+        alert("The uploaded CSV file is empty or could not be read.");
+        return;
+      }
+
+      console.log('bulkUploadPlayers: Function invoked with file:', file.name);
+      console.log('CSV file text content length:', text.length);
+
+      Papa.parse(text, {
+        header: true, // Treat first row as headers
         skipEmptyLines: true,
         transformHeader: (header) => header.trim().toLowerCase(), // Normalize headers
         complete: (results) => {
-          console.log("CSV Parse Complete. Meta Fields:", results.meta.fields);
-          console.log("CSV Parsed Data (raw):", results.data);
+          console.log('CSV Parse Complete. Meta Fields:', results.meta.fields);
+          console.log('CSV Parsed Data:', results.data);
 
-          const newPlayers: Player[] = [];
-          const processingErrors: string[] = []; // Renamed for clarity
-
-          if (!Array.isArray(results.data)) {
-            processingErrors.push("CSV data could not be parsed as an array. Please check file format.");
-            console.error("PapaParse results.data is not an array:", results.data);
-            alert(`Error processing CSV: ${processingErrors.join('\n')}`);
-            setState((prevState) => ({ ...prevState, isBulkUploadingPlayers: false }));
+          if (!results.data || results.data.length === 0) {
+            alert('CSV file processed, but no valid data rows were found.');
+            setTournamentState(prev => ({ ...prev, isBulkUploadingPlayers: false }));
             return;
           }
 
-          results.data.forEach((data: any, index) => {
-            const rowNum = index + 2; // Account for 0-indexed data and header row
-            // Ensure mandatory fields exist after header transform
-            const name = data.name?.trim();
-            const mobileNumber = data.mobilenumber?.trim(); // 'mobilenumber' because of transformHeader
-            const rating = data.rating ? parseInt(data.rating, 10) : 1500;
-            let category = data.category?.trim();
+          setTournamentState(prev => {
+            const updatedPlayersMap = new Map<string, Player>(prev.players.map(p => [p.mobileNumber, p]));
+            let currentPlayersAddedCount = 0;
 
-            if (!name) {
-              processingErrors.push(`Row ${rowNum}: Player Name is missing.`);
-              return;
-            }
-            if (!mobileNumber) {
-              processingErrors.push(`Row ${rowNum}: Mobile Number is missing.`);
-              return;
-            }
-
-            // Flexible category matching
-            let matchedCategory = PLAYER_CATEGORIES.find(cat => cat.toLowerCase() === (category || '').toLowerCase());
-            if (!matchedCategory && category) {
-              // Try matching numeric part, e.g., "30" to "30+"
-              const numericCat = parseInt(category, 10);
-              if (!isNaN(numericCat)) {
-                matchedCategory = PLAYER_CATEGORIES.find(cat => cat === `${numericCat}+`);
-              }
-            }
-
-            if (!matchedCategory) {
-              processingErrors.push(`Row ${rowNum}: Invalid category '${category || ''}'. Defaulting to '${DEFAULT_PLAYER_CATEGORY}'. Valid categories: ${PLAYER_CATEGORIES.join(', ')}.`);
-              category = DEFAULT_PLAYER_CATEGORY; // Default if not found
-            } else {
-              category = matchedCategory;
-            }
-
-            const player: Player = {
-              id: uuidv4(),
-              name,
-              mobileNumber,
-              rating,
-              wins: 0,
-              losses: 0,
-              draws: 0,
-              category,
-            };
-            player.qrData = generatePlayerQRData(player); // Generate QR data
-            newPlayers.push(player);
-          });
-
-          console.log("New Players Constructed (before state update):", newPlayers);
-          console.log("Errors during CSV processing (before state update):", processingErrors);
-
-          if (newPlayers.length > 0) {
-            setState((prevState) => {
-              // Filter out players that might have the same mobileNumber & category combination
-              const existingPlayers = new Set(prevState.players.map(p => `${p.mobileNumber}-${p.category}`));
-              const playersToAdd = newPlayers.filter(p => !existingPlayers.has(`${p.mobileNumber}-${p.category}`));
-
-              if (playersToAdd.length < newPlayers.length) {
-                processingErrors.push(`${newPlayers.length - playersToAdd.length} players were skipped due to duplicate mobile number/category combinations.`);
+            results.data.forEach((csvRow: any, index: number) => {
+              // Normalize row keys
+              const normalizedCsvRow: { [key: string]: string | number | undefined } = {};
+              for (const key in csvRow) {
+                normalizedCsvRow[key.trim().toLowerCase()] = csvRow[key];
               }
 
-              console.log("Players actually being added to state:", playersToAdd);
-              const updatedPlayers = [...prevState.players, ...playersToAdd];
-              console.log("App state updated with new players. Total players:", updatedPlayers.length, updatedPlayers);
-              return {
-                ...prevState,
-                players: updatedPlayers,
-              };
+              const name = normalizedCsvRow.name as string;
+              const mobileNumber = normalizedCsvRow.mobilenumber as string; // Fix: mobilenumber
+              const rating = normalizedCsvRow.rating ? parseInt(normalizedCsvRow.rating as string, 10) : undefined;
+              let category = normalizedCsvRow.category as string;
+              const imageUrl = normalizedCsvRow.imageurl as string; // Fix: imageUrl
+
+              if (!name || !mobileNumber) {
+                processingErrors.push(`Row ${index + 2}: Skipping player due to missing name or mobile number: ${JSON.stringify(normalizedCsvRow)}`);
+                return;
+              }
+
+              // Flexible category matching (e.g., "30" to "30+")
+              if (category && !PLAYER_CATEGORIES.includes(category)) {
+                const numericCategory = parseInt(category, 10);
+                const matchedCategory = PLAYER_CATEGORIES.find(pc => parseInt(pc, 10) === numericCategory);
+                if (matchedCategory) {
+                  category = matchedCategory;
+                } else {
+                  processingErrors.push(`Row ${index + 2}: Unrecognized category '${category}'. Defaulting to '${DEFAULT_PLAYER_CATEGORY}'. Valid categories: ${PLAYER_CATEGORIES.join(', ')}`);
+                  category = DEFAULT_PLAYER_CATEGORY;
+                }
+              } else if (!category) {
+                category = DEFAULT_PLAYER_CATEGORY;
+              }
+
+              // Check for duplicate mobile number (if exists, update; otherwise, add new)
+              if (updatedPlayersMap.has(mobileNumber)) {
+                const existingPlayer = updatedPlayersMap.get(mobileNumber)!;
+                // Only update if the category is different, or if other details change
+                if (existingPlayer.category !== category || existingPlayer.name !== name || existingPlayer.rating !== rating || existingPlayer.imageUrl !== imageUrl) {
+                  updatedPlayersMap.set(mobileNumber, {
+                    ...existingPlayer,
+                    name: name,
+                    category: category,
+                    rating: rating ?? existingPlayer.rating,
+                    imageUrl: imageUrl ?? existingPlayer.imageUrl,
+                  });
+                }
+                // If the exact player (mobileNumber and category) is a duplicate, skip adding
+                const isExactDuplicate = prev.players.some(p => p.mobileNumber === mobileNumber && p.category === category);
+                if (!isExactDuplicate) {
+                    currentPlayersAddedCount++; // Count for updates/new unique category registrations
+                }
+              } else {
+                // New player, or new category for existing mobile number
+                const newPlayer: Player = {
+                  id: generateUniqueId(),
+                  name,
+                  mobileNumber,
+                  rating: rating ?? 1500,
+                  wins: 0,
+                  losses: 0,
+                  draws: 0,
+                  category,
+                  imageUrl,
+                };
+                updatedPlayersMap.set(mobileNumber, newPlayer); // Add to map for subsequent checks
+                currentPlayersAddedCount++;
+              }
             });
+
+            playersAddedCount = currentPlayersAddedCount;
+            const finalPlayers = Array.from(updatedPlayersMap.values());
+            console.log('New Players to Add:', finalPlayers);
+
+            let alertMessage = "";
+            if (playersAddedCount > 0) {
+              alertMessage += `${playersAddedCount} players uploaded/updated successfully!\n`;
+            } else {
+              alertMessage += "0 players uploaded/updated successfully!\n";
+            }
             if (processingErrors.length > 0) {
-              alert(`Successfully added ${newPlayers.length - processingErrors.length} players. Some players were skipped:\n\n${processingErrors.join('\n')}`);
+              alertMessage += `\nWarnings/Errors:\n${processingErrors.join('\n')}`;
+              alert(alertMessage); // Show specific errors
+            } else if (playersAddedCount > 0) {
+              alert(alertMessage); // Only show success if no errors
             } else {
-              alert(`Successfully added ${newPlayers.length} players.`);
+                alert("CSV processed, but no new unique players were added. Check console for details.");
             }
-          } else if (processingErrors.length > 0) {
-            alert(`No players were added due to the following errors:\n\n${processingErrors.join('\n')}`);
-          } else {
-            alert("CSV processed, but no valid players were found. Please check your file format and data (e.g., all names/mobile numbers were empty).");
-          }
-          setState((prevState) => ({ ...prevState, isBulkUploadingPlayers: false })); // Reset loading state
+
+            return { ...prev, players: finalPlayers, isBulkUploadingPlayers: false };
+          });
         },
-        error: (err: any) => {
-          console.error("PapaParse Error:", err);
-          alert(`Error processing CSV file: ${err.message || 'Unknown error'}`);
-          setState((prevState) => ({ ...prevState, isBulkUploadingPlayers: false })); // Reset loading state
+        error: (error) => {
+          console.error('PapaParse error:', error);
+          alert(`CSV parsing failed: ${error.message}. Please check your CSV file format.`);
+          setTournamentState(prev => ({ ...prev, isBulkUploadingPlayers: false }));
         },
-        beforeFirstChunk: (chunk: string) => {
-          // This is a workaround for files potentially having a BOM (Byte Order Mark)
-          // which can interfere with parsing.
-          if (chunk.charCodeAt(0) === 0xFEFF) {
-            return chunk.substr(1);
-          }
-          return chunk;
-        },
-        skipUnmatchedHeaders: true, // Only process defined headers
       });
-    } catch (e: any) {
-      console.error("Synchronous error during Papa.parse invocation:", e);
-      alert(`Unexpected error while preparing CSV parser: ${e.message || 'Unknown error'}`);
-      setState((prevState) => ({ ...prevState, isBulkUploadingPlayers: false })); // Reset loading state
+    } catch (error) {
+      console.error('Error processing bulk player upload:', error);
+      alert('Failed to upload players. Check console for details.');
+      setTournamentState(prev => ({ ...prev, isBulkUploadingPlayers: false }));
+    } finally {
+      // isBulkUploadingPlayers is set to false in `complete` or `error` callbacks
+      console.log('CSV parsing process finished.');
+      console.log('App state updated with new players. Total players:', tournamentState.players.length); // This might be old state
     }
-  }, [setState]);
+  }, [players]); // Dependency on 'players' to re-create callback if players change
 
 
-  const updateMatchScore = (matchId: string, score1: number, score2: number) => {
-    setState((prevState) => {
-      const updatedMatches = prevState.matches.map((match) => {
+  // Tournament Settings
+  const [selectedTournamentType, setSelectedTournamentType] = useState<TournamentType>(
+    tournamentSettings?.tournamentType || DEFAULT_TOURNAMENT_TYPE
+  );
+  const [selectedMatchFormat, setSelectedMatchFormat] = useState<MatchFormat>(
+    tournamentSettings?.matchFormat || MatchFormat.Knockout
+  );
+  const [minPlayersPerHybridGroup, setMinPlayersPerHybridGroup] = useState<number>(
+    tournamentSettings?.minPlayersPerHybridGroup || DEFAULT_MIN_PLAYERS_PER_HYBRID_GROUP
+  );
+
+  useEffect(() => {
+    if (tournamentSettings) {
+      setSelectedTournamentType(tournamentSettings.tournamentType);
+      setSelectedMatchFormat(tournamentSettings.matchFormat);
+      setMinPlayersPerHybridGroup(tournamentSettings.minPlayersPerHybridGroup || DEFAULT_MIN_PLAYERS_PER_HYBRID_GROUP);
+    }
+  }, [tournamentSettings]);
+
+  const handleTournamentTypeChange = useCallback((type: TournamentType) => {
+    setSelectedTournamentType(type);
+    setTournamentState(prev => ({
+      ...prev,
+      tournamentSettings: prev.tournamentSettings
+        ? { ...prev.tournamentSettings, tournamentType: type }
+        : {
+          tournamentName: 'New Tournament',
+          numRounds: 3,
+          selectedPlayerIds: [],
+          matchFormat: MatchFormat.Knockout,
+          tournamentType: type,
+        }
+    }));
+  }, []);
+
+  const handleMatchFormatChange = useCallback((format: MatchFormat) => {
+    setSelectedMatchFormat(format);
+    setTournamentState(prev => ({
+      ...prev,
+      tournamentSettings: prev.tournamentSettings
+        ? { ...prev.tournamentSettings, matchFormat: format }
+        : {
+          tournamentName: 'New Tournament',
+          numRounds: 3,
+          selectedPlayerIds: [],
+          matchFormat: format,
+          tournamentType: selectedTournamentType,
+        }
+    }));
+  }, [selectedTournamentType]);
+
+  const handleMinPlayersPerHybridGroupChange = useCallback((minPlayers: number) => {
+    setMinPlayersPerHybridGroup(minPlayers);
+    setTournamentState(prev => ({
+      ...prev,
+      tournamentSettings: prev.tournamentSettings
+        ? { ...prev.tournamentSettings, minPlayersPerHybridGroup: minPlayers }
+        : {
+          tournamentName: 'New Tournament',
+          numRounds: 3,
+          selectedPlayerIds: [],
+          matchFormat: selectedMatchFormat,
+          tournamentType: selectedTournamentType,
+          minPlayersPerHybridGroup: minPlayers,
+        }
+    }));
+  }, [selectedMatchFormat, selectedTournamentType]);
+
+
+  // Knockout Tournament Logic
+  const generateKnockoutMatchesForRound = useCallback((round: number, previousRoundMatches: Match[]) => {
+    const winners = previousRoundMatches
+      .filter(m => m.winnerId)
+      .map(m => players.find(p => p.id === m.winnerId));
+
+    if (winners.length < 2) {
+      return [];
+    }
+
+    const shuffledWinners = [...winners].sort(() => 0.5 - Math.random());
+
+    const nextRoundMatches: Match[] = [];
+    for (let i = 0; i < shuffledWinners.length; i += 2) {
+      if (shuffledWinners[i] && shuffledWinners[i + 1]) { // Ensure both players exist
+        nextRoundMatches.push({
+          id: generateUniqueId(),
+          player1Id: shuffledWinners[i]!.id,
+          player2Id: shuffledWinners[i + 1]!.id,
+          score1: null,
+          score2: null,
+          winnerId: null,
+          round: round,
+          isComplete: false,
+          category: shuffledWinners[i]!.category,
+        });
+      }
+    }
+    return nextRoundMatches;
+  }, [players]);
+
+  const startKnockoutTournament = useCallback((settings: TournamentSettings) => {
+    if (settings.selectedPlayerIds.length < 2) {
+      alert('Cannot start tournament with fewer than 2 players.');
+      return;
+    }
+    // Check if number of players is a power of 2 for knockout
+    if (settings.selectedPlayerIds.length & (settings.selectedPlayerIds.length - 1)) {
+      alert('For knockout, number of players should ideally be a power of 2 (e.g., 2, 4, 8, 16).');
+      // For simplicity, we can still proceed but it might mean byes or uneven matches.
+      // For now, let's keep it as an alert and let the user decide.
+    }
+
+    const eligiblePlayers = players.filter(p => settings.selectedPlayerIds.includes(p.id));
+    const shuffledPlayers = [...eligiblePlayers].sort(() => 0.5 - Math.random());
+
+    const initialMatches: Match[] = [];
+    for (let i = 0; i < shuffledPlayers.length; i += 2) {
+      if (shuffledPlayers[i+1]) { // Ensure there are two players for a match
+        initialMatches.push({
+          id: generateUniqueId(),
+          player1Id: shuffledPlayers[i].id,
+          player2Id: shuffledPlayers[i + 1].id,
+          score1: null,
+          score2: null,
+          winnerId: null,
+          round: 1,
+          isComplete: false,
+          category: eligiblePlayers[0].category, // Assume one category for simplicity in knockout
+        });
+      } else {
+        // If odd number of players, last player gets a bye. This logic can be enhanced.
+        alert(`${shuffledPlayers[i].name} gets a bye in Round 1.`);
+      }
+    }
+
+    setTournamentState((prev) => ({
+      ...prev,
+      tournamentSettings: settings,
+      matches: initialMatches,
+      currentRound: 1,
+      activeFixtureCategories: [], // Reset for new tournament type
+      generatedFixtures: {},
+      generatedHybridGroups: {},
+      isGeneratingFixture: {},
+      isGeneratingHybridGroups: {},
+      publishedFixtures: {},
+      roundSummaries: {},
+    }));
+  }, [players]);
+
+
+  // Update Match Scores and Player Stats
+  const handleUpdateMatchScore = useCallback((matchId: string, score1: number, score2: number) => {
+    setTournamentState((prev) => {
+      const updatedPlayers = [...prev.players]; // Create a mutable copy of players array
+      const player1 = updatedPlayers.find(p => p.id === prev.matches.find(m => m.id === matchId)?.player1Id);
+      const player2 = updatedPlayers.find(p => p.id === prev.matches.find(m => m.id === matchId)?.player2Id);
+
+      const updatedMatches = prev.matches.map((match) => {
         if (match.id === matchId) {
-          const newMatch = { ...match, score1, score2 };
-          // Determine winner if scores are final
-          if (newMatch.score1 !== null && newMatch.score2 !== null) {
-            if (newMatch.score1 > newMatch.score2) {
-              newMatch.winnerId = newMatch.player1Id;
-            } else if (newMatch.score2 > newMatch.score1) {
-              newMatch.winnerId = newMatch.player2Id;
+          let winnerId: string | null = null;
+          let isComplete = false;
+
+          if (score1 !== null && score2 !== null) {
+            isComplete = true;
+            if (score1 > score2) {
+              winnerId = match.player1Id;
+            } else if (score2 > score1) {
+              winnerId = match.player2Id;
             } else {
-              newMatch.winnerId = null; // Draw
+              winnerId = null; // A draw
             }
-            newMatch.isComplete = true;
           }
+
+          const oldWinnerId = match.winnerId;
+          const oldIsComplete = match.isComplete;
+
+          const newMatch = { ...match, score1, score2, winnerId, isComplete };
+
+          // Update player stats only if match completed or winner changed
+          if (isComplete && !oldIsComplete) { // Match just completed
+            if (player1 && player2) {
+              if (winnerId === player1.id) {
+                player1.wins++;
+                player2.losses++;
+              } else if (winnerId === player2.id) {
+                player2.wins++;
+                player1.losses++;
+              } else { // Draw
+                player1.draws++;
+                player2.draws++;
+              }
+
+              // Simple ELO-like rating adjustment
+              const K = 32; // K-factor
+              const R1 = player1.rating;
+              const R2 = player2.rating;
+              const E1 = 1 / (1 + Math.pow(10, (R2 - R1) / 400));
+              const E2 = 1 / (1 + Math.pow(10, (R1 - R2) / 400));
+
+              let S1 = 0.5; // Draw
+              let S2 = 0.5; // Draw
+              if (winnerId === player1.id) { S1 = 1; S2 = 0; }
+              else if (winnerId === player2.id) { S1 = 0; S2 = 1; }
+
+              player1.rating = R1 + K * (S1 - E1);
+              player2.rating = R2 + K * (S2 - E2);
+            }
+          } else if (isComplete && oldIsComplete && oldWinnerId !== winnerId) { // Winner changed after completion
+            if (player1 && player2) {
+              // Revert old stats
+              if (oldWinnerId === player1.id) { player1.wins--; player2.losses--; }
+              else if (oldWinnerId === player2.id) { player2.wins--; player1.losses--; }
+              else { player1.draws--; player2.draws--; } // old was a draw
+
+              // Apply new stats
+              if (winnerId === player1.id) { player1.wins++; player2.losses++; }
+              else if (winnerId === player2.id) { player2.wins++; player1.losses++; }
+              else { player1.draws++; player2.draws++; } // new is a draw
+
+              // Recalculate ELO based on new outcome (simplified, could be more complex with full match history)
+              const K = 32;
+              const R1 = player1.rating; // Current rating after previous match results
+              const R2 = player2.rating;
+              const E1 = 1 / (1 + Math.pow(10, (R2 - R1) / 400));
+              const E2 = 1 / (1 + Math.pow(10, (R1 - R2) / 400));
+
+              let S1_new = 0.5;
+              let S2_new = 0.5;
+              if (winnerId === player1.id) { S1_new = 1; S2_new = 0; }
+              else if (winnerId === player2.id) { S1_new = 0; S2_new = 1; }
+
+              let S1_old = 0.5;
+              let S2_old = 0.5;
+              if (oldWinnerId === player1.id) { S1_old = 1; S2_old = 0; }
+              else if (oldWinnerId === player2.id) { S1_old = 0; S2_old = 1; }
+
+              // Revert old ELO change and apply new one
+              player1.rating = player1.rating - K * (S1_old - E1) + K * (S1_new - E1);
+              player2.rating = player2.rating - K * (S2_old - E2) + K * (S2_new - E2);
+            }
+          }
+
+
           return newMatch;
         }
         return match;
       });
-      return { ...prevState, matches: updatedMatches };
+
+      return { ...prev, matches: updatedMatches, players: updatedPlayers };
     });
-  };
+  }, []);
 
-  const calculateEloRating = (
-    playerRating: number,
-    opponentRating: number,
-    outcome: 'win' | 'loss' | 'draw',
-  ): number => {
-    const K = 32; // Elo K-factor
-    const Ra = playerRating;
-    const Rb = opponentRating;
 
-    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400)); // Expected score for player A
+  // --- Memoized values for round completion ---
+  const isCurrentRoundComplete = React.useMemo(() => {
+    return matches.filter((m) => m.round === currentRound).every((m) => m.isComplete);
+  }, [matches, currentRound]);
 
-    let Sa: number; // Actual score for player A
-    if (outcome === 'win') Sa = 1;
-    else if (outcome === 'loss') Sa = 0;
-    else Sa = 0.5;
-
-    return Ra + K * (Sa - Ea);
-  };
-
-  // Fix: Move useMemo definitions before useCallback if they are dependencies
-  const isRoundComplete = useMemo(() => {
-    return state.matches.filter(m => m.round === state.currentRound).every(m => m.isComplete);
-  }, [state.matches, state.currentRound]);
-
-  const isTournamentCompleted = useMemo(() => {
-    if (!state.tournamentSettings || state.currentRound === 0) return false;
-
-    // Check if all active matches for the current round (and possibly previous) are complete
-    const allMatchesCompleted = state.matches.filter(m => m.round <= state.currentRound).every(m => m.isComplete);
-    if (!allMatchesCompleted) return false;
-
-    if (state.tournamentSettings.matchFormat === MatchFormat.Knockout) {
-      // In Knockout, tournament is complete if the number of winners is 1 (final winner decided)
-      // or if all rounds are completed and no more matches can be made.
-      const currentRoundWinners = new Set(state.matches.filter(m => m.round === state.currentRound && m.winnerId).map(m => m.winnerId));
-      // If there's 1 winner, tournament is definitely done (implies previous round was final)
-      return currentRoundWinners.size <= 1 && allMatchesCompleted;
-    } else if (state.tournamentSettings.matchFormat === MatchFormat.RoundRobin) {
-      // For Round Robin, if all initial RR matches are complete, the tournament is done.
-      // Assuming all RR matches are in Round 1 for simplicity here.
-      return allMatchesCompleted;
-    } else if (state.tournamentSettings.matchFormat === MatchFormat.Hybrid) {
-      // Hybrid: RR stage complete, then knockout starts. If knockout winners are <= 1, tournament is complete.
-      // This will be true when `completeRound` sets `isTournamentCompleted` at the end of knockout stage.
-      return allMatchesCompleted && state.currentRound > 1; // Assuming round 1 is RR, subsequent are knockout
+  const isTournamentCompleted = React.useMemo(() => {
+    if (currentRound === 0) return false;
+    if (tournamentSettings?.matchFormat === MatchFormat.Knockout) {
+      const previousRoundMatches = matches.filter(m => m.round === currentRound);
+      const winnersOfLastRound = previousRoundMatches.filter(m => m.winnerId);
+      // Tournament is complete if current round matches are all complete AND
+      // there's only one winner from the previous round (or no matches left to generate)
+      return isCurrentRoundComplete && winnersOfLastRound.length <= 1;
+    } else if (tournamentSettings?.matchFormat === MatchFormat.RoundRobin || tournamentSettings?.matchFormat === MatchFormat.Hybrid) {
+      // For RR/Hybrid, assume tournament completed if all initial matches are complete
+      // More complex logic for hybrid's knockout stage transition would go here
+      return isCurrentRoundComplete && matches.filter(m => m.round === currentRound).length > 0;
     }
     return false;
-  }, [state.matches, state.currentRound, state.tournamentSettings]);
+  }, [matches, currentRound, isCurrentRoundComplete, tournamentSettings?.matchFormat]);
 
 
-  const completeRound = useCallback(async () => {
-    if (!state.tournamentSettings) {
-      alert("Tournament settings are not defined.");
+  const handleCompleteRound = useCallback(async () => {
+    if (!isCurrentRoundComplete) {
+      alert('Please complete all matches in the current round before moving on.');
       return;
     }
 
-    const currentRoundMatches = state.matches.filter((m) => m.round === state.currentRound);
+    setTournamentState(prev => ({ ...prev, isLoadingSummary: true }));
+    try {
+      const currentRoundMatches = matches.filter(m => m.round === currentRound);
+      const summary = await generateRoundSummary(currentRound, currentRoundMatches.map(m => ({
+        player1: players.find(p => p.id === m.player1Id)?.name || m.player1Id,
+        player2: players.find(p => p.id === m.player2Id)?.name || m.player2Id,
+        round: m.round, // CsvMatch requires round
+        category: m.category,
+        group: m.group,
+      })), players);
 
-    if (currentRoundMatches.some((m) => !m.isComplete)) {
-      alert('Please complete all matches in the current round before proceeding.');
-      return;
-    }
+      setTournamentState((prev) => {
+        let nextMatches: Match[] = [];
+        let nextRound = prev.currentRound + 1;
+        let tournamentIsCompleted = false; // Renamed to avoid conflict
 
-    // 1. Update player stats (wins, losses, draws, rating)
-    setState((prevState) => {
-      const updatedPlayers = [...prevState.players];
-      const playerMap = new Map<string, Player>(updatedPlayers.map((p) => [p.id, { ...p }]));
+        const previousRoundMatches = prev.matches.filter(m => m.round === prev.currentRound);
 
-      currentRoundMatches.forEach((match) => {
-        const player1 = playerMap.get(match.player1Id);
-        const player2 = playerMap.get(match.player2Id);
-
-        if (!player1 || !player2) return; // Should not happen
-
-        let outcome1: 'win' | 'loss' | 'draw';
-        let outcome2: 'win' | 'loss' | 'draw';
-
-        if (match.winnerId === player1.id) {
-          player1.wins += 1;
-          player2.losses += 1;
-          outcome1 = 'win';
-          outcome2 = 'loss';
-        } else if (match.winnerId === player2.id) {
-          player1.losses += 1;
-          player2.wins += 1;
-          outcome1 = 'loss';
-          outcome2 = 'win';
-        } else {
-          // Draw
-          player1.draws += 1;
-          player2.draws += 1;
-          outcome1 = 'draw';
-          outcome2 = 'draw';
+        if (prev.tournamentSettings?.matchFormat === MatchFormat.Knockout) {
+          nextMatches = generateKnockoutMatchesForRound(nextRound, previousRoundMatches);
+          if (nextMatches.length === 0 && previousRoundMatches.length > 0) {
+            tournamentIsCompleted = true; // Last winner determined
+            alert("Tournament has a winner!");
+          } else if (nextMatches.length === 0 && previousRoundMatches.length === 0 && prev.currentRound === 1) {
+             // No matches were generated for round 1 or 0 players, effectively no tournament
+             tournamentIsCompleted = true;
+          }
+        } else if (prev.tournamentSettings?.matchFormat === MatchFormat.RoundRobin) {
+          // For Round Robin, typically all matches are in Round 1.
+          // If you wanted multiple RR rounds, this logic would need a `generateNextRoundRobinMatches` function.
+          // For now, assume RR completes after all Round 1 matches are done.
+          tournamentIsCompleted = true;
+        } else if (prev.tournamentSettings?.matchFormat === MatchFormat.Hybrid) {
+            // HYBRID LOGIC: Transition from Round Robin (group stage) to Knockout
+            // Placeholder: This is complex and needs full implementation
+            // 1. Identify top N players from each group based on wins/points
+            // 2. Generate a knockout bracket from these top players
+            alert("Hybrid tournament: Group stage complete. Logic for knockout bracket generation is a placeholder.");
+            tournamentIsCompleted = true; // For now, mark as complete after group stage
         }
 
-        // Update Elo ratings
-        player1.rating = calculateEloRating(player1.rating, player2.rating, outcome1);
-        player2.rating = calculateEloRating(player2.rating, player1.rating, outcome2);
-
-        playerMap.set(player1.id, player1);
-        playerMap.set(player2.id, player2);
+        return {
+          ...prev,
+          matches: [...prev.matches, ...nextMatches],
+          currentRound: tournamentIsCompleted ? prev.currentRound : nextRound,
+          roundSummaries: { ...prev.roundSummaries, [prev.currentRound]: summary },
+          // Fix: Use isLoadingSummary from state
+          isLoadingSummary: false,
+        };
       });
-
-      return { ...prevState, players: Array.from(playerMap.values()) };
-    });
-
-    // 2. Generate Round Summary
-    setState((prevState) => ({ ...prevState, isLoadingSummary: true }));
-    try {
-      const summary = await generateRoundSummary(state.players, state.matches, state.currentRound);
-      setState((prevState) => ({
-        ...prevState,
-        roundSummaries: { ...prevState.roundSummaries, [prevState.currentRound]: summary },
-      }));
     } catch (error) {
-      console.error("Failed to generate round summary:", error);
-      alert("Failed to generate AI round summary. Check console for details.");
-    } finally {
-      setState((prevState) => ({ ...prevState, isLoadingSummary: false }));
+      console.error("Error completing round or generating summary:", error);
+      setTournamentState(prev => ({ ...prev, isLoadingSummary: false }));
+      alert(`Failed to complete round or generate summary. Error: ${error instanceof Error ? error.message : String(error)}`);
     }
-
-    // 3. Generate matches for the next round based on tournament format
-    let nextRoundMatches: Match[] = [];
-    let isCurrentTournamentCompleted = false; // Use a local variable here
-
-    if (state.tournamentSettings.matchFormat === MatchFormat.Knockout) {
-      // Logic for Knockout: Top players from current round progress
-      const winners = state.players.filter(
-        (p) =>
-          currentRoundMatches.some((m) => m.winnerId === p.id)
-      ).sort((a, b) => b.rating - a.rating); // Sort winners by rating
-
-      if (winners.length < 2) {
-        isCurrentTournamentCompleted = true; // Tournament ends if less than 2 winners
-      } else {
-        // Generate next round pairings from winners
-        const numNextRoundMatches = Math.floor(winners.length / 2);
-        for (let i = 0; i < numNextRoundMatches; i++) {
-          const player1 = winners[i];
-          const player2 = winners[winners.length - 1 - i]; // Simple pairing for now
-          if (player1 && player2 && player1.id !== player2.id) {
-            nextRoundMatches.push({
-              id: uuidv4(),
-              player1Id: player1.id,
-              player2Id: player2.id,
-              score1: null,
-              score2: null,
-              winnerId: null,
-              round: state.currentRound + 1,
-              isComplete: false,
-              category: player1.category, // Carry over category
-            });
-          }
-        }
-        isCurrentTournamentCompleted = winners.length <= 2; // If only 2 winners, it's the final. If 1, winner already decided.
-      }
+  }, [isCurrentRoundComplete, matches, currentRound, players, generateKnockoutMatchesForRound, tournamentSettings?.matchFormat, tournamentSettings?.numRounds]);
 
 
-    } else if (state.tournamentSettings.matchFormat === MatchFormat.RoundRobin) {
-      // For Round Robin, all matches are typically in Round 1. Subsequent 'rounds' are just for result updates.
-      // The tournament is considered complete once all initial matches are played.
-      isCurrentTournamentCompleted = true; // All matches were in round 1 for a simple RR
-    } else if (state.tournamentSettings.matchFormat === MatchFormat.Hybrid) {
-      // Hybrid logic: Identify top 2 from each group, then generate knockout bracket
-      // This is assumed to be the transition from RR groups to knockout rounds (e.g., after round 1)
-      const isGroupStage = state.currentRound === 1; // Assuming RR group stage is round 1
-      if (isGroupStage) {
-        const playersInTournament = state.players.filter(p => state.matches.some(m => m.player1Id === p.id || m.player2Id === p.id));
-        const groupedPlayers: Record<string, Record<string, Player[]>> = {}; // category -> group -> players
-
-        // Group players based on matches played in current round
-        currentRoundMatches.forEach(match => {
-          [match.player1Id, match.player2Id].forEach(pId => {
-            const player = playersInTournament.find(p => p.id === pId);
-            if (player && match.category && match.group) {
-              if (!groupedPlayers[match.category]) groupedPlayers[match.category] = {};
-              if (!groupedPlayers[match.category][match.group]) groupedPlayers[match.category][match.group] = [];
-              if (!groupedPlayers[match.category][match.group].some(p => p.id === player.id)) {
-                groupedPlayers[match.category][match.group].push(player);
-              }
-            }
-          });
-        });
-
-        const topQualifiers: Player[] = [];
-        const uniqueQualifiers = new Set<string>(); // To prevent duplicate players if they qualify from multiple groups/categories
-
-        for (const category in groupedPlayers) {
-          for (const group in groupedPlayers[category]) {
-            const playersInGroup = groupedPlayers[category][group];
-            // Calculate wins/points for players within this specific group
-            const groupStandings = playersInGroup.map(p => {
-              const wins = currentRoundMatches.filter(m => m.round === state.currentRound && (m.player1Id === p.id || m.player2Id === p.id) && m.winnerId === p.id && m.category === category && m.group === group).length;
-              const draws = currentRoundMatches.filter(m => m.round === state.currentRound && (m.player1Id === p.id || m.player2Id === p.id) && m.winnerId === null && m.isComplete && m.category === category && m.group === group).length;
-              const points = (wins * 3) + (draws * 1); // Simple point system: 3 for win, 1 for draw
-              return { player: p, wins, draws, points };
-            }).sort((a, b) => {
-              // Sort by points, then wins, then rating
-              if (b.points !== a.points) return b.points - a.points;
-              if (b.wins !== a.wins) return b.wins - a.wins;
-              return b.player.rating - a.player.rating;
-            });
-
-            // Identify top 2 from each group and add to qualifiers if not already added
-            groupStandings.slice(0, 2).forEach(s => {
-              if (!uniqueQualifiers.has(s.player.id)) {
-                topQualifiers.push(s.player);
-                uniqueQualifiers.add(s.player.id);
-              }
-            });
-          }
-        }
-
-        if (topQualifiers.length > 1) {
-          // Generate knockout bracket for top qualifiers
-          try {
-            // Group qualifiers by category to generate per-category knockout brackets
-            const categoryQualifiersMap: Record<string, Player[]> = topQualifiers.reduce((acc, p) => {
-              if (!acc[p.category]) acc[p.category] = [];
-              acc[p.category].push(p);
-              return acc;
-            }, {});
-
-            for (const cat in categoryQualifiersMap) {
-              const qualifiersInCat = categoryQualifiersMap[cat];
-              if (qualifiersInCat.length >= 2) {
-                const bracket = await generateKnockoutBracketWithGemini(qualifiersInCat, cat);
-                const mappedBracket: Match[] = bracket.map((m: any) => {
-                  const p1 = state.players.find(p => p.name === m.player1);
-                  const p2 = state.players.find(p => p.name === m.player2);
-                  if (p1 && p2) {
-                    return {
-                      id: uuidv4(),
-                      player1Id: p1.id,
-                      player2Id: p2.id,
-                      score1: null,
-                      score2: null,
-                      winnerId: null,
-                      round: state.currentRound + 1, // Next round for knockout
-                      isComplete: false,
-                      category: m.category || cat,
-                      group: m.group, // Group might not apply in knockout, but include if Gemini sends it
-                    } as Match; // Explicitly cast to Match
-                  }
-                  return null;
-                }).filter((m): m is Match => m !== null);
-                nextRoundMatches.push(...mappedBracket);
-              } else {
-                console.warn(`Category ${cat} has less than 2 qualifiers, skipping knockout bracket generation for this category.`);
-              }
-            }
-          } catch (error) {
-            console.error("Error generating knockout bracket for hybrid tournament:", error);
-            alert("Failed to generate knockout bracket for hybrid tournament.");
-          }
-          isCurrentTournamentCompleted = nextRoundMatches.length === 0 && topQualifiers.length > 0; // If no matches made but qualifiers exist, something's wrong or it's the end
-        } else {
-          isCurrentTournamentCompleted = true; // Not enough qualifiers for knockout
-        }
-      } else {
-        // Subsequent knockout rounds in hybrid format
-        const winners = state.players.filter(
-          (p) =>
-            currentRoundMatches.some((m) => m.winnerId === p.id)
-        ).sort((a, b) => b.rating - a.rating);
-
-        if (winners.length < 2) {
-          isCurrentTournamentCompleted = true;
-        } else {
-          const numNextRoundMatches = Math.floor(winners.length / 2);
-          for (let i = 0; i < numNextRoundMatches; i++) {
-            const player1 = winners[i];
-            const player2 = winners[winners.length - 1 - i];
-            if (player1 && player2 && player1.id !== player2.id) {
-              nextRoundMatches.push({
-                id: uuidv4(),
-                player1Id: player1.id,
-                player2Id: player2.id,
-                score1: null,
-                score2: null,
-                winnerId: null,
-                round: state.currentRound + 1,
-                isComplete: false,
-                category: player1.category,
-              });
-            }
-          }
-          isCurrentTournamentCompleted = winners.length <= 2;
-        }
-      }
-    }
-
-    setState((prevState) => ({
-      ...prevState,
-      currentRound: prevState.currentRound + 1,
-      matches: [...prevState.matches, ...nextRoundMatches],
-      tournamentSettings: prevState.tournamentSettings ? { ...prevState.tournamentSettings, customFixtureUploaded: false } : null, // Reset flag
-      // isTournamentCompleted: isCurrentTournamentCompleted, // No, this should be handled by useMemo
-    }));
-  }, [state.players, state.matches, state.currentRound, state.tournamentSettings, setState]);
-
-
-  // ---- Tournament Setup Handlers ----
-  const handleTournamentTypeChange = useCallback((type: TournamentType) => {
-    setSelectedTournamentType(type);
-    setState(prevState => ({
-      ...prevState,
-      tournamentSettings: prevState.tournamentSettings ? { ...prevState.tournamentSettings, tournamentType: type } : null
-    }));
-  }, [setState]);
-
-  const handleMatchFormatChange = useCallback((format: MatchFormat) => {
-    setSelectedMatchFormat(format);
-    setState(prevState => ({
-      ...prevState,
-      tournamentSettings: prevState.tournamentSettings ? { ...prevState.tournamentSettings, matchFormat: format } : null
-    }));
-  }, [setState]);
-
-  const handleMinPlayersPerHybridGroupChange = useCallback((minPlayers: number) => {
-    setMinPlayersPerHybridGroup(minPlayers);
-    setState(prevState => ({
-      ...prevState,
-      tournamentSettings: prevState.tournamentSettings ? { ...prevState.tournamentSettings, minPlayersPerHybridGroup: minPlayers } : null
-    }));
-  }, [setState]);
-
-  const startTournament = useCallback(
-    (settings: TournamentSettings) => {
-      if (state.players.length < 2) {
-        alert('Not enough players registered to start a tournament.');
-        return;
-      }
-
-      let initialMatches: Match[] = [];
-
-      if (settings.matchFormat === MatchFormat.Knockout) {
-        const selectedPlayers = state.players.filter(p => settings.selectedPlayerIds.includes(p.id));
-
-        if (selectedPlayers.length < 2) {
-          alert('Please select at least two players for the knockout tournament.');
-          return;
-        }
-
-        // Simple pairing for Round 1 of knockout
-        const numMatches = Math.floor(selectedPlayers.length / 2);
-        for (let i = 0; i < numMatches; i++) {
-          const player1 = selectedPlayers[i];
-          const player2 = selectedPlayers[selectedPlayers.length - 1 - i]; // Pair first with last, etc.
-          if (player1 && player2 && player1.id !== player2.id) {
-            initialMatches.push({
-              id: uuidv4(),
-              player1Id: player1.id,
-              player2Id: player2.id,
-              score1: null,
-              score2: null,
-              winnerId: null,
-              round: 1,
-              isComplete: false,
-              category: player1.category, // Carry over category
-            });
-          }
-        }
-      } else if (settings.matchFormat === MatchFormat.RoundRobin) {
-        // Round Robin tournament is started by activating category fixtures
-        // This function would only be called if no fixtures have been added yet, which is not the case for RR
-        alert("For Round Robin, add matches for categories first, then click 'Start Round Robin Tournament'.");
-        return;
-      } else if (settings.matchFormat === MatchFormat.Hybrid) {
-        alert("For Hybrid, generate groups & fixtures or upload custom fixture, then click 'Add Hybrid Fixture Matches to Tournament'.");
-        return;
-      }
-
-      setState((prevState) => ({
-        ...prevState,
-        tournamentSettings: settings,
-        matches: initialMatches,
-        currentRound: 1,
-        roundSummaries: {},
-        activeFixtureCategories: [], // Reset for new tournament
-        generatedFixtures: {},
-        isGeneratingFixture: {},
-        generatedHybridGroups: {},
-        isGeneratingHybridGroups: {},
-        publishedFixtures: {}, // Reset published fixtures for new tournament
-      }));
-    },
-    [state.players, setState],
-  );
-
-  const onStartRoundRobinTournament = useCallback(() => {
-    if (!state.tournamentSettings) {
-      alert("Please configure tournament settings (name, rounds, type) first.");
-      return;
-    }
-    // Check if any matches are actually present in round 1
-    const round1Matches = state.matches.filter(m => m.round === 1);
-    if (round1Matches.length === 0) {
-      alert("No matches have been added for Round Robin tournament. Please generate and add fixtures for categories first.");
-      return;
-    }
-
-    setState(prevState => ({
-      ...prevState,
-      currentRound: 1,
-      roundSummaries: {},
-    }));
-  }, [state.tournamentSettings, state.matches, setState]);
-
-
-  const handleGenerateCategoryFixture = useCallback(async (category: string, group?: string) => {
-    setState(prevState => ({
-      ...prevState,
-      isGeneratingFixture: { ...prevState.isGeneratingFixture, [category]: true }
-    }));
-    try {
-      if (!process.env.API_KEY) {
-        alert("API Key is not configured. Please select your API key to use AI features.");
-        return;
-      }
-      const playersInSelectedCategory = group
-        ? (state.generatedHybridGroups[category]?.flat() || []).filter(p => p.group === group) // Filter by group if specified
-        : state.players.filter(p => p.category === category); // Filter by category only
-
-      if (playersInSelectedCategory.length < 2) {
-        alert(`Need at least 2 players in the '${category}' category${group ? ` (Group: ${group})` : ''} to generate a fixture.`);
-        return;
-      }
-      const fixture = await generateCategoryFixtureWithGemini(playersInSelectedCategory, category, group);
-
-      setState(prevState => ({
-        ...prevState,
-        generatedFixtures: {
-          ...prevState.generatedFixtures,
-          // Use a composite key for groups like 'Category-Group-1'
-          [group ? `${category}-Group-${group}` : category]: fixture
-        }
-      }));
-    } catch (error) {
-      console.error("Error generating category fixture:", error);
-      alert("Failed to generate fixture. Please check API key and try again.");
-    } finally {
-      setState(prevState => ({
-        ...prevState,
-        isGeneratingFixture: { ...prevState.isGeneratingFixture, [category]: false }
-      }));
-    }
-  }, [state.players, state.generatedHybridGroups, state.isGeneratingFixture, setState]);
-
-  const handleDownloadFixture = useCallback((fixtureData: { player1: string; player2: string; category?: string; group?: string; }[], filenamePrefix: string) => {
-    if (fixtureData.length === 0) {
-      alert("No fixture data to download.");
-      return;
-    }
-    const csvHeader = ["Player 1", "Player 2", "Category", "Group"].join(',');
-    const csvRows = fixtureData.map(match =>
-      `"${match.player1}","${match.player2}","${match.category || ''}","${match.group || ''}"`
-    ).join('\n');
-    const csvContent = `${csvHeader}\n${csvRows}`;
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    if (link.download !== undefined) {
-      const url = URL.createObjectURL(blob);
-      link.setAttribute('href', url);
-      link.setAttribute('download', `${filenamePrefix.replace(/\s+/g, '_')}_fixture.csv`);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+  // Reset Tournament
+  const handleResetTournament = useCallback(() => {
+    if (window.confirm('Are you sure you want to reset the entire tournament? This cannot be undone.')) {
+      setTournamentState(initialState);
+      setSelectedTournamentType(DEFAULT_TOURNAMENT_TYPE);
+      setSelectedMatchFormat(MatchFormat.Knockout); // Reset to default
+      setMinPlayersPerHybridGroup(DEFAULT_MIN_PLAYERS_PER_HYBRID_GROUP);
     }
   }, []);
 
+  // Round Robin Fixture Generation
+  const handleGenerateCategoryFixture = useCallback(async (category: string) => {
+    setTournamentState(prev => ({
+      ...prev,
+      isGeneratingFixture: { ...prev.isGeneratingFixture, [category]: true }
+    }));
+    try {
+      if (!process.env.API_KEY) {
+        alert("Gemini API Key is not configured. Please select your API key to generate fixtures.");
+        return;
+      }
+      const fixture = await generateRoundRobinFixture(players, category);
+      setTournamentState(prev => ({
+        ...prev,
+        generatedFixtures: { ...prev.generatedFixtures, [category]: fixture }
+      }));
+    } catch (error) {
+      console.error(`Error generating RR fixture for ${category}:`, error);
+      alert(`Failed to generate round-robin fixture for ${category}. Ensure players are sufficient. Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setTournamentState(prev => ({
+        ...prev,
+        isGeneratingFixture: { ...prev.isGeneratingFixture, [category]: false }
+      }));
+    }
+  }, [players]);
+
+  const handleDownloadFixture = useCallback((fixtureData: CsvMatch[], filenamePrefix: string) => {
+    const csvContent = "data:text/csv;charset=utf-8,"
+      + "player1,player2,round,category,group\n"
+      + fixtureData.map(e => `${e.player1},${e.player2},${e.round},${e.category || ''},${e.group || ''}`).join("\n");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `${filenamePrefix}_fixture.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }, []);
+
+  const handleAddFixtureMatchesToTournament = useCallback((category: string, fixture: CsvMatch[]) => {
+    setTournamentState(prev => {
+      // Ensure all players in the fixture exist
+      const playerMap = new Map(prev.players.map(p => [p.name, p.id]));
+      const newMatches: Match[] = fixture.map(fMatch => {
+        const player1Id = playerMap.get(fMatch.player1);
+        const player2Id = playerMap.get(fMatch.player2);
+
+        if (!player1Id || !player2Id) {
+          console.warn(`Player not found for match: ${fMatch.player1} vs ${fMatch.player2}. Skipping match.`);
+          return null; // Skip this match
+        }
+
+        return {
+          id: generateUniqueId(),
+          player1Id,
+          player2Id,
+          score1: null,
+          score2: null,
+          winnerId: null,
+          round: fMatch.round || 1, // Default to round 1 if not specified
+          isComplete: false,
+          category: fMatch.category || category,
+          group: fMatch.group,
+        };
+      }).filter((m: Match | null): m is Match => m !== null) as Match[]; // Fix: Explicitly type the filter callback
+
+      return {
+        ...prev,
+        matches: [...prev.matches, ...newMatches],
+        activeFixtureCategories: [...new Set([...prev.activeFixtureCategories, category])],
+        currentRound: prev.currentRound === 0 && newMatches.length > 0 ? 1 : prev.currentRound, // Start round 1 if not already started and matches added
+        tournamentSettings: prev.tournamentSettings || { // Create default settings if not existing
+          tournamentName: 'Round Robin Tournament',
+          numRounds: 1, // Will need to be adjusted for multi-round RR or hybrid
+          selectedPlayerIds: Array.from(playerMap.values()),
+          matchFormat: selectedMatchFormat,
+          tournamentType: selectedTournamentType,
+          minPlayersPerHybridGroup: minPlayersPerHybridGroup,
+        },
+      };
+    });
+  }, [players, selectedMatchFormat, selectedTournamentType, minPlayersPerHybridGroup]);
+
+  const isFixtureActiveForCategory = useCallback((category: string) => {
+    return activeFixtureCategories.includes(category);
+  }, [activeFixtureCategories]);
+
+  const handleStartRoundRobinTournament = useCallback(() => {
+    if (activeFixtureCategories.length === 0) {
+      alert('Please generate and add at least one fixture to the tournament first.');
+      return;
+    }
+    // Check if there are actual matches added from the active fixtures
+    const hasMatchesForRound1 = matches.some(m => m.round === 1);
+    if (!hasMatchesForRound1) {
+        alert('No matches have been added to the tournament. Please add fixtures before starting.');
+        return;
+    }
+
+    setTournamentState(prev => ({
+      ...prev,
+      currentRound: 1,
+      tournamentSettings: prev.tournamentSettings || {
+        tournamentName: 'Round Robin Tournament',
+        numRounds: 1, // Placeholder
+        selectedPlayerIds: players.map(p => p.id), // All players for RR
+        matchFormat: MatchFormat.RoundRobin,
+        tournamentType: selectedTournamentType,
+      }
+    }));
+  }, [activeFixtureCategories.length, players, selectedTournamentType, matches]);
+
+
+  // Hybrid Tournament Logic
+  const handleAddHybridFixtureMatchesToTournament = useCallback((fixtureData: CsvMatch[]) => {
+    setTournamentState(prev => {
+      const playerMap = new Map(prev.players.map(p => [p.name, p.id]));
+      const newMatches: Match[] = fixtureData.map(fMatch => {
+        const player1Id = playerMap.get(fMatch.player1);
+        const player2Id = playerMap.get(fMatch.player2);
+
+        if (!player1Id || !player2Id) {
+          console.warn(`Player not found for match: ${fMatch.player1} vs ${fMatch.player2}. Skipping match.`);
+          return null;
+        }
+
+        return {
+          id: generateUniqueId(),
+          player1Id,
+          player2Id,
+          score1: null,
+          score2: null,
+          winnerId: null,
+          round: fMatch.round || 1,
+          isComplete: false,
+          category: fMatch.category,
+          group: fMatch.group,
+        };
+      }).filter((m: Match | null): m is Match => m !== null) as Match[]; // Fix: Explicitly type the filter callback
+
+      const updatedCategories = new Set(prev.activeFixtureCategories);
+      fixtureData.forEach(f => { // Using fixtureData here
+        if (f.category) updatedCategories.add(f.category);
+        if (f.group) updatedCategories.add(`${f.category || 'unknown'}-${f.group}`); // Add group key as active category
+      });
+
+      return {
+        ...prev,
+        matches: [...prev.matches, ...newMatches],
+        activeFixtureCategories: Array.from(updatedCategories),
+        currentRound: prev.currentRound === 0 && newMatches.length > 0 ? 1 : prev.currentRound, // Start round 1 if matches added
+        tournamentSettings: prev.tournamentSettings || {
+          tournamentName: 'Hybrid Tournament',
+          numRounds: 1, // Will be dynamically adjusted or set to 1 for initial RR stage
+          selectedPlayerIds: Array.from(playerMap.values()),
+          matchFormat: MatchFormat.Hybrid,
+          tournamentType: selectedTournamentType,
+          minPlayersPerHybridGroup: minPlayersPerHybridGroup,
+        },
+      };
+    });
+  }, [players, selectedTournamentType, minPlayersPerHybridGroup]);
+
+
+  const handleGenerateHybridFixtures = useCallback(async (category: string) => {
+    setTournamentState(prev => ({
+      ...prev,
+      isGeneratingHybridGroups: { ...prev.isGeneratingHybridGroups, [category]: true }
+    }));
+    // Fix: Declare processingErrors variable
+    let processingErrors: string[] = [];
+    try {
+      if (!process.env.API_KEY) {
+        alert("Gemini API Key is not configured. Please select your API key to generate hybrid fixtures.");
+        return;
+      }
+      const result = await generateHybridGroupsAndFixtures(players, category, minPlayersPerHybridGroup);
+      const groupFixtures: Record<string, CsvMatch[]> = {};
+      let generatedGroupsAsPlayers: Player[][] = result.groups; // Already Player objects from service
+
+      // Client-side grouping logic for hybrid to ensure minPlayersPerGroup is met
+      const playersInSelectedCategory = players.filter(p => p.category === category);
+      if (playersInSelectedCategory.length > 0) { // Only apply if there are players in the category
+        const minPlayers = minPlayersPerHybridGroup;
+        const numGroups = Math.max(1, Math.floor(playersInSelectedCategory.length / minPlayers));
+
+        // Shuffle players and create groups
+        const shuffledCategoryPlayers = [...playersInSelectedCategory].sort(() => 0.5 - Math.random());
+        let tempGroups: Player[][] = Array.from({ length: numGroups }, () => []);
+
+        let playerIndex = 0;
+        for (let i = 0; i < numGroups; i++) {
+          for (let j = 0; j < minPlayers && playerIndex < shuffledCategoryPlayers.length; j++) {
+            tempGroups[i].push(shuffledCategoryPlayers[playerIndex++]);
+          }
+        }
+        // Distribute remaining players
+        while (playerIndex < shuffledCategoryPlayers.length) {
+          tempGroups[playerIndex % numGroups].push(shuffledCategoryPlayers[playerIndex++]);
+        }
+
+        // Filter out any groups that might not meet minPlayers if player distribution was uneven or not enough players overall
+        generatedGroupsAsPlayers = tempGroups.filter(group => group.length >= minPlayers);
+        if (generatedGroupsAsPlayers.length === 0 && playersInSelectedCategory.length >= minPlayers) {
+          // If after distribution, no groups meet min, force one group if total players permit
+          generatedGroupsAsPlayers = [playersInSelectedCategory];
+        } else if (generatedGroupsAsPlayers.length === 0 && playersInSelectedCategory.length < minPlayers) {
+          alert(`Not enough players (${playersInSelectedCategory.length}) in ${category} to form groups of ${minPlayers} for Hybrid Tournament.`);
+          setTournamentState(prev => ({
+            ...prev,
+            isGeneratingHybridGroups: { ...prev.isGeneratingHybridGroups, [category]: false }
+          }));
+          return;
+        }
+      } else {
+        alert(`No players found in category ${category} to generate hybrid fixtures.`);
+        setTournamentState(prev => ({
+          ...prev,
+          isGeneratingHybridGroups: { ...prev.isGeneratingHybridGroups, [category]: false }
+        }));
+        return;
+      }
+
+      // Now use Gemini to generate RR fixtures for these client-side defined groups
+      for (const group of generatedGroupsAsPlayers) {
+        if (group.length >= 2) {
+          const groupName = `Group-${generatedGroupsAsPlayers.indexOf(group) + 1}`;
+          try {
+            const rrFixtureForGroup = await generateRoundRobinFixture(group, category);
+            groupFixtures[`${category}-${groupName}`] = rrFixtureForGroup.map(m => ({ ...m, group: groupName, category: category }));
+          } catch (rrError) {
+            console.error(`Error generating RR fixture for ${category}, ${groupName}:`, rrError);
+            // Fix: Use processingErrors variable
+            processingErrors.push(`Failed to generate RR fixture for ${category}, ${groupName}.`);
+          }
+        } else {
+          // Fix: Use processingErrors variable
+          processingErrors.push(`Skipping group in ${category} with less than 2 players for RR fixture.`);
+        }
+      }
+
+      setTournamentState(prev => ({
+        ...prev,
+        generatedHybridGroups: { ...prev.generatedHybridGroups, [category]: generatedGroupsAsPlayers },
+        generatedFixtures: { ...prev.generatedFixtures, ...groupFixtures }, // Add all group fixtures
+      }));
+       // Fix: Use processingErrors variable
+       if (processingErrors.length > 0) {
+        alert(`Hybrid fixture generation completed with some warnings/errors:\n${processingErrors.join('\n')}`);
+      } else {
+        alert(`Hybrid fixtures generated successfully for ${category}!`);
+      }
+    } catch (error) {
+      console.error(`Error generating hybrid groups and fixtures for ${category}:`, error);
+      alert(`Failed to generate hybrid groups and fixtures for ${category}. Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setTournamentState(prev => ({
+        ...prev,
+        isGeneratingHybridGroups: { ...prev.isGeneratingHybridGroups, [category]: false }
+      }));
+    }
+  }, [players, minPlayersPerHybridGroup, generateRoundRobinFixture]); // Added generateRoundRobinFixture to dependencies
+
+
+  const handleUploadCustomFixture = useCallback(async (file: File) => {
+    try {
+      const text = await file.text();
+      const customFixture = Papa.parse(text, {
+        header: true,
+        skipEmptyLines: true,
+        transformHeader: (header) => header.trim().toLowerCase(),
+      }).data as CsvMatch[];
+
+      if (customFixture.length === 0) {
+        alert('Custom fixture CSV is empty or malformed. Please check the file.');
+        return;
+      }
+
+      setTournamentState(prev => ({
+        ...prev,
+        generatedFixtures: {
+          ...prev.generatedFixtures,
+          'customUploaded': customFixture, // Store it under a specific key
+        },
+        tournamentSettings: {
+          ...(prev.tournamentSettings || {}),
+          customFixtureUploaded: true,
+          matchFormat: MatchFormat.Hybrid, // Assume custom fixture implies Hybrid or RR
+        } as TournamentSettings,
+      }));
+      // Automatically add to tournament matches after upload
+      handleAddHybridFixtureMatchesToTournament(customFixture); // Fix: Call this after setting generatedFixtures
+      alert('Custom fixture uploaded and added to tournament matches!');
+    } catch (error) {
+      console.error('Error uploading custom fixture:', error);
+      alert('Failed to upload custom fixture. Ensure it is a valid CSV and check console for details.');
+    }
+  }, [handleAddHybridFixtureMatchesToTournament]);
+
+
+  // Publishing Fixtures
+  const handlePublishFixture = useCallback((categoryKey: string) => {
+    if (generatedFixtures[categoryKey]) {
+      setTournamentState(prev => ({
+        ...prev,
+        publishedFixtures: {
+          ...prev.publishedFixtures,
+          [categoryKey]: generatedFixtures[categoryKey],
+        }
+      }));
+      alert(`Fixture for ${categoryKey} published to Player Portal!`);
+    } else {
+      alert(`No fixture found for ${categoryKey} to publish.`);
+    }
+  }, [generatedFixtures]);
+
+  const isFixturePublished = useCallback((categoryKey: string) => {
+    return !!publishedFixtures[categoryKey];
+  }, [publishedFixtures]);
+
+
+  // QR Scanner (Placeholder, not fully integrated into app flow, just component available)
+  const [showQRScanner, setShowQRScanner] = useState(false);
+
+  const handleQRScanSuccess = useCallback((data: string) => {
+    alert(`QR Scanned: ${data}`);
+    setShowQRScanner(false);
+    // Here you would parse the QR data and handle player registration or lookup
+    // e.g., if QR data is a player's mobile number, you could find them.
+  }, []);
+
+  const handleQRScannerClose = useCallback(() => {
+    setShowQRScanner(false);
+  }, []);
+
+
+  // PNG Export
   const handleGeneratePngFixture = useCallback(async (targetElementId: string, filename: string) => {
     const input = document.getElementById(targetElementId);
-    if (!input) {
-      alert('Fixture table element not found for PNG export. Ensure the table is rendered and visible.');
-      return;
-    }
-    try {
-      const canvas = await html2canvas(input);
-      const imgData = canvas.toDataURL('image/png');
-
-      const link = document.createElement('a');
-      link.href = imgData;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } catch (error) {
-      console.error("Error generating PNG fixture:", error);
-      alert("Failed to generate PNG image. Ensure the table is visible and not obstructed.");
+    if (input) {
+      try {
+        const canvas = await html2canvas(input, {
+          scale: 2, // Increase resolution for better quality
+          useCORS: true, // If images/resources are from different origins
+        });
+        const imgData = canvas.toDataURL('image/png');
+        const link = document.createElement('a');
+        link.href = imgData;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        alert('Fixture saved as PNG!');
+      } catch (error) {
+        console.error('Error generating PNG:', error);
+        alert('Failed to generate PNG. Make sure the element is visible and check console for errors.');
+      }
+    } else {
+      alert(`Error: Element with ID '${targetElementId}' not found.`);
     }
   }, []);
 
 
-  const addCategoryFixtureMatchesToTournament = useCallback((category: string, fixture: { player1: string; player2: string; category?: string; group?: string; }[]) => {
-    if (!state.tournamentSettings) {
-      alert("Tournament settings are not defined. Cannot add matches.");
-      return;
-    }
-
-    const newMatches: Match[] = fixture.map(f => {
-      const player1 = state.players.find(p => p.name === f.player1);
-      const player2 = state.players.find(p => p.name === f.player2);
-      if (!player1 || !player2) {
-        console.warn(`Skipping fixture match due to unknown player: ${f.player1} vs ${f.player2}`);
-        return null;
-      }
-      return {
-        id: uuidv4(),
-        player1Id: player1.id,
-        player2Id: player2.id,
-        score1: null,
-        score2: null,
-        winnerId: null,
-        round: 1, // All initial RR matches are in Round 1
-        isComplete: false,
-        category: f.category || category, // Ensure category is set
-        group: f.group, // Ensure group is set if applicable
-      } as Match; // Explicitly cast to Match
-    }).filter((m): m is Match => m !== null); // Filter out nulls
-
-    if (newMatches.length === 0) {
-      alert("No valid matches could be added from the generated fixture.");
-      return;
-    }
-
-    setState(prevState => ({
-      ...prevState,
-      matches: [...prevState.matches, ...newMatches],
-      activeFixtureCategories: [...new Set([...prevState.activeFixtureCategories, category])] // Add category to active list
-    }));
-    alert(`Added ${newMatches.length} matches for ${category} to the tournament.`);
-
-  }, [state.players, state.tournamentSettings, setState]);
-
-  const isFixtureActiveForCategory = useCallback((category: string): boolean => {
-    return state.activeFixtureCategories.includes(category) || state.matches.some(m => m.round === 1 && m.category === category);
-  }, [state.activeFixtureCategories, state.matches]);
-
-  const handlePublishFixture = useCallback((categoryKey: string) => {
-    const fixtureToPublish = state.generatedFixtures[categoryKey];
-    if (!fixtureToPublish || fixtureToPublish.length === 0) {
-      alert("No fixture generated to publish.");
-      return;
-    }
-    setState(prevState => ({
-      ...prevState,
-      publishedFixtures: {
-        ...prevState.publishedFixtures,
-        [categoryKey]: fixtureToPublish
-      }
-    }));
-    alert(`Fixture for ${categoryKey} published to Player Portal.`);
-  }, [state.generatedFixtures, setState]);
-
-  const isFixturePublished = useCallback((categoryKey: string): boolean => {
-    return !!state.publishedFixtures[categoryKey] && state.publishedFixtures[categoryKey].length > 0;
-  }, [state.publishedFixtures]);
-
-
-  // ---- Hybrid Tournament Handlers ----
-  const handleGenerateHybridFixtures = useCallback(async (category: string) => {
-    setState(prevState => ({
-      ...prevState,
-      isGeneratingHybridGroups: { ...prevState.isGeneratingHybridGroups, [category]: true },
-      isGeneratingFixture: { ...prevState.isGeneratingFixture, [category]: true } // Also set fixture loading
-    }));
-    try {
-      if (!process.env.API_KEY) {
-        alert("API Key is not configured. Please select your API key to use AI features.");
-        return;
-      }
-
-      const playersInSelectedCategory = state.players.filter(p => p.category === category);
-
-      if (playersInSelectedCategory.length < minPlayersPerHybridGroup) {
-        alert(`Need at least ${minPlayersPerHybridGroup} players in the '${category}' category to generate hybrid groups.`);
-        return;
-      }
-      if (playersInSelectedCategory.length < 4 && minPlayersPerHybridGroup < 4) {
-        alert(`Warning: For meaningful round-robin, consider at least 4 players per group. Current min is ${minPlayersPerHybridGroup}.`);
-      }
-
-      // --- Client-side Grouping Logic ---
-      const shuffledPlayers = [...playersInSelectedCategory].sort(() => 0.5 - Math.random()); // Shuffle for fairness
-      const numGroups = Math.max(1, Math.floor(shuffledPlayers.length / minPlayersPerHybridGroup));
-      let groups: Player[][] = Array.from({ length: numGroups }, () => []);
-
-      // Distribute players as evenly as possible initially
-      shuffledPlayers.forEach((player, index) => {
-        groups[index % numGroups].push(player);
-      });
-
-      // Refine groups to meet minPlayersPerHybridGroup
-      let refinedGroups: Player[][] = [];
-      let remainingPlayers: Player[] = [];
-
-      groups.forEach(group => {
-        if (group.length >= minPlayersPerHybridGroup) {
-          refinedGroups.push(group);
-        } else {
-          remainingPlayers.push(...group);
-        }
-      });
-
-      // Try to redistribute remaining players
-      if (remainingPlayers.length > 0) {
-        // First, try to fill up existing small groups (if any, though `refinedGroups` should only have valid size)
-        // Then, add to largest groups, or create new groups if a sufficient number of players remain
-        if (remainingPlayers.length >= minPlayersPerHybridGroup) {
-          refinedGroups.push(remainingPlayers); // Add as one new group if enough players
-        } else {
-          // If remaining players are too few for a new group, distribute them
-          remainingPlayers.forEach(player => {
-            if (refinedGroups.length > 0) {
-              const smallestRefinedGroup = refinedGroups.sort((a,b) => a.length - b.length)[0];
-              smallestRefinedGroup.push(player);
-            } else {
-              // This case should ideally not happen if playersInSelectedCategory >= minPlayersPerHybridGroup
-              refinedGroups.push([player]);
-            }
-          });
-        }
-      }
-
-      // Fix: Change const to let to allow reassignment
-      let finalGroups = refinedGroups.filter(group => group.length >= minPlayersPerHybridGroup);
-
-      if (finalGroups.length === 0 && playersInSelectedCategory.length > 0) {
-        alert(`Warning: Could not form groups of at least ${minPlayersPerHybridGroup} players for category '${category}'. All players will be placed in one group, potentially smaller than min size.`);
-        finalGroups = [playersInSelectedCategory]; // As a fallback, put all in one group
-      } else if (finalGroups.length < refinedGroups.length) {
-        alert(`Warning: Some groups for category '${category}' did not meet the minimum ${minPlayersPerHybridGroup} players and were removed. Only valid groups will proceed.`);
-      }
-
-      // --- Gemini for RR Fixture within each group ---
-      const generatedGroupFixtures: Record<string, { player1: string; player2: string; category?: string; group?: string; }[]> = {};
-      await Promise.all(finalGroups.map(async (group, index) => {
-        const groupName = `Group ${index + 1}`;
-        if (group.length >= 2) {
-          const fixture = await generateCategoryFixtureWithGemini(group, category, groupName);
-          generatedGroupFixtures[`${category}-${groupName}`] = fixture;
-        } else {
-          console.warn(`Group ${groupName} in category ${category} has less than 2 players, skipping fixture generation.`);
-        }
-      }));
-
-      setState(prevState => ({
-        ...prevState,
-        generatedHybridGroups: {
-          ...prevState.generatedHybridGroups,
-          [category]: finalGroups
-        },
-        generatedFixtures: {
-          ...prevState.generatedFixtures,
-          ...generatedGroupFixtures
-        }
-      }));
-
-    } catch (error) {
-      console.error("Error generating hybrid groups and fixtures:", error);
-      alert("Failed to generate hybrid groups or fixtures. Please check API key and try again.");
-    } finally {
-      setState(prevState => ({
-        ...prevState,
-        isGeneratingHybridGroups: { ...prevState.isGeneratingHybridGroups, [category]: false },
-        isGeneratingFixture: { ...prevState.isGeneratingFixture, [category]: false }
-      }));
-    }
-  }, [state.players, minPlayersPerHybridGroup, state.isGeneratingHybridGroups, state.isGeneratingFixture, setState, generateCategoryFixtureWithGemini]);
-
-
-  const handleUploadCustomFixture = useCallback((file: File) => {
-    console.log("handleUploadCustomFixture: Function invoked with file:", file);
-
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: (header) => header.trim().toLowerCase(),
-      complete: (results) => {
-        console.log("Custom Fixture CSV Parse Complete. Meta Fields:", results.meta.fields);
-        console.log("Custom Fixture CSV Parsed Data (raw):", results.data);
-
-        const customMatches: CsvMatch[] = [];
-        const processingErrors: string[] = []; // Renamed for clarity
-
-        if (!Array.isArray(results.data)) {
-          processingErrors.push("Custom Fixture CSV data could not be parsed as an array. Please check file format.");
-          console.error("PapaParse results.data is not an array for custom fixture:", results.data);
-          alert(`Error processing Custom Fixture CSV: ${processingErrors.join('\n')}`);
-          return;
-        }
-
-        results.data.forEach((data: any, index) => {
-          const rowNum = index + 2;
-          const player1Name = data.player1?.trim();
-          const player2Name = data.player2?.trim();
-          const round = data.round ? parseInt(data.round, 10) : 1;
-          const category = data.category?.trim() || 'default'; // Use 'default' or actual category
-          const group = data.group?.trim() || null;
-
-          if (!player1Name || !player2Name) {
-            processingErrors.push(`Row ${rowNum}: Player 1 or Player 2 name is missing.`);
-            return;
-          }
-
-          customMatches.push({
-            player1: player1Name,
-            player2: player2Name,
-            round,
-            category,
-            group,
-          });
-        });
-
-        console.log("Custom Matches Constructed:", customMatches);
-        console.log("Errors during Custom Fixture CSV processing:", processingErrors);
-
-        if (customMatches.length > 0) {
-          setState(prevState => ({
-            ...prevState,
-            // Store custom matches in a special key or directly process them
-            // For now, let's just make it available for the 'Add Hybrid Fixture Matches' button
-            generatedFixtures: {
-              ...prevState.generatedFixtures,
-              'customUploaded': customMatches // Store under a unique key
-            },
-            tournamentSettings: prevState.tournamentSettings ? { ...prevState.tournamentSettings, customFixtureUploaded: true } : null
-          }));
-          if (processingErrors.length > 0) {
-            alert(`Successfully processed ${customMatches.length - processingErrors.length} custom matches. Some rows were skipped:\n\n${processingErrors.join('\n')}`);
-          } else {
-            alert(`Successfully processed ${customMatches.length} custom matches. Click 'Add Hybrid Fixture Matches to Tournament' to add them.`);
-          }
-        } else if (processingErrors.length > 0) {
-          alert(`No custom matches were added due to the following errors:\n\n${processingErrors.join('\n')}`);
-        } else {
-          alert("Custom Fixture CSV processed, but no valid matches were found. Please check your file format and data.");
-        }
-      },
-      error: (err: any) => {
-        console.error("PapaParse Error for custom fixture:", err);
-        alert(`Error processing Custom Fixture CSV file: ${err.message || 'Unknown error'}`);
-      },
-      beforeFirstChunk: (chunk: string) => {
-        if (chunk.charCodeAt(0) === 0xFEFF) {
-          return chunk.substr(1);
-        }
-        return chunk;
-      },
-      skipUnmatchedHeaders: true,
-    });
-  }, [setState]);
-
-  // Fix: Changed the type of fixtureData parameter to CsvMatch[] to correctly include 'round'
-  const onAddHybridFixtureMatchesToTournament = useCallback((fixtureData: CsvMatch[]) => {
-    if (!state.tournamentSettings) {
-      alert("Tournament settings are not defined. Cannot add matches.");
-      return;
-    }
-
-    const matchesToAdd: Match[] = [];
-    const processingErrors: string[] = [];
-
-    // Prioritize customUploaded if present, otherwise use generated
-    const sourceFixture: CsvMatch[] = state.tournamentSettings.customFixtureUploaded && state.generatedFixtures['customUploaded']
-      ? (state.generatedFixtures['customUploaded'] as CsvMatch[])
-      : fixtureData;
-
-    if (!sourceFixture || sourceFixture.length === 0) {
-      alert("No fixture data (generated or custom uploaded) to add for hybrid tournament.");
-      return;
-    }
-
-    sourceFixture.forEach((f, index) => {
-      const player1 = state.players.find(p => p.name === f.player1);
-      const player2 = state.players.find(p => p.name === f.player2);
-      if (!player1 || !player2) {
-        processingErrors.push(`Fixture row ${index + 1}: Could not find player(s) for ${f.player1} vs ${f.player2}.`);
-        return;
-      }
-      matchesToAdd.push({
-        id: uuidv4(),
-        player1Id: player1.id,
-        player2Id: player2.id,
-        score1: null,
-        score2: null,
-        winnerId: null,
-        round: f.round || 1, // Use round from CSV or default to 1
-        isComplete: false,
-        category: f.category || player1.category, // Use category from CSV or player's category
-        group: f.group, // Use group from CSV
-      });
-    });
-
-    if (matchesToAdd.length === 0) {
-      alert(`No valid matches could be added to the tournament. Errors: ${processingErrors.join('; ')}`);
-      return;
-    }
-
-    setState(prevState => ({
-      ...prevState,
-      matches: [...prevState.matches, ...matchesToAdd],
-      currentRound: 1, // Start hybrid tournament at Round 1 with these matches
-      tournamentSettings: prevState.tournamentSettings ? { ...prevState.tournamentSettings, customFixtureUploaded: true } : null,
-      roundSummaries: {},
-      activeFixtureCategories: [...new Set([...prevState.activeFixtureCategories, ...(sourceFixture.map(f => f.category || '').filter(Boolean) as string[])])], // Add all categories involved
-    }));
-    alert(`Added ${matchesToAdd.length} matches for hybrid tournament. ${processingErrors.length > 0 ? `Warnings: ${processingErrors.join('; ')}` : ''}`);
-
-  }, [state.players, state.tournamentSettings, state.generatedFixtures, setState]);
-
-
-  const resetTournament = useCallback(() => {
-    if (window.confirm('Are you sure you want to reset all tournament data? This cannot be undone.')) {
-      setState({
-        players: [],
-        matches: [],
-        currentRound: 0,
-        tournamentSettings: null,
-        roundSummaries: {},
-        isAdminLoggedIn: state.isAdminLoggedIn, // Keep login status
-        currentMode: 'admin', // Default to admin after reset
-        activeFixtureCategories: [],
-        generatedFixtures: {},
-        isGeneratingFixture: {},
-        generatedHybridGroups: {},
-        isGeneratingHybridGroups: {},
-        publishedFixtures: {}, // Reset published fixtures
-        isBulkUploadingPlayers: false, // Reset bulk upload state
-      });
-      setSelectedTournamentType(DEFAULT_TOURNAMENT_TYPE);
-      setSelectedMatchFormat(MatchFormat.Knockout);
-      setMinPlayersPerHybridGroup(DEFAULT_MIN_PLAYERS_PER_HYBRID_GROUP);
-      alert('All tournament data has been reset.');
-    }
-  }, [state.isAdminLoggedIn, setState]);
+  // Render logic
 
   return (
     <div className="min-h-screen bg-gray-100">
       <Header
-        title="New Tournament"
-        currentMode={state.currentMode}
+        title="Tournament Tracker"
+        currentMode={currentMode}
         onModeChange={handleModeChange}
-        isLoggedIn={state.isAdminLoggedIn}
+        isLoggedIn={isAdminLoggedIn}
         onLogout={handleLogout}
       />
+      <main className="container mx-auto p-4">
+        {currentMode === 'admin' && !isAdminLoggedIn && (
+          <div className="text-center p-8 bg-white rounded-lg shadow-md mb-6">
+            <h2 className="text-xl font-bold mb-4">Admin Portal</h2>
+            <p className="text-gray-600 mb-4">Please log in to access admin features.</p>
+            <Button onClick={() => setShowLoginModal(true)}>Admin Login</Button>
+          </div>
+        )}
 
-      <main className="container mx-auto p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-        {state.currentMode === 'admin' && (
+        {(currentMode === 'user' || isAdminLoggedIn) && (
           <>
-            <div className="md:col-span-1 space-y-4">
-              <PlayerList
-                players={state.players}
-                onAddPlayer={addPlayer}
-                onDeletePlayer={deletePlayer}
-                onUpdatePlayer={updatePlayer}
-                onBulkUploadPlayers={bulkUploadPlayers}
-                isAdminMode={state.isAdminLoggedIn}
-                isBulkUploadingPlayers={state.isBulkUploadingPlayers} // Pass loading state
-                onScanPlayerQR={() => {
-                  setScanPurpose('player_add_qr');
-                  setShowQRScanner(true);
-                }}
-              />
-              {showQRScanner && scanPurpose === 'player_add_qr' && (
-                <QRScanner
-                  onScan={(qrData) => {
-                    try {
-                      const { name, mobile } = JSON.parse(qrData);
-                      if (name && mobile) {
-                        addPlayer(name, mobile, DEFAULT_PLAYER_CATEGORY); // Add with default category for now
-                        alert(`Player ${name} (${mobile}) added successfully.`);
-                      } else {
-                        alert("Invalid QR data for player registration.");
-                      }
-                    } catch (e) {
-                      alert("Failed to parse QR data. Ensure it's a valid player JSON.");
-                      console.error("QR scan error:", e);
-                    } finally {
-                      setShowQRScanner(false);
-                      setScanPurpose(null);
-                    }
-                  }}
-                  onClose={() => {
-                    setShowQRScanner(false);
-                    setScanPurpose(null);
-                  }}
-                />
-              )}
-            </div>
+            <PlayerList
+              players={players}
+              onAddPlayer={handleAddPlayer}
+              onDeletePlayer={handleDeletePlayer}
+              onUpdatePlayer={handleUpdatePlayer}
+              onBulkUploadPlayers={handleBulkUploadPlayers}
+              isAdminMode={isAdminLoggedIn && currentMode === 'admin'}
+              isBulkUploadingPlayers={isBulkUploadingPlayers}
+              // onScanPlayerQR={() => setShowQRScanner(true)} // Example of how QR scanner could be used
+            />
 
-            <div className="md:col-span-2 space-y-4">
+            {isAdminLoggedIn && currentMode === 'admin' && (
               <TournamentSetup
-                players={state.players}
-                tournamentSettings={state.tournamentSettings}
-                onStartTournament={startTournament}
-                onResetTournament={resetTournament}
-                isAdminMode={state.isAdminLoggedIn}
-                currentRound={state.currentRound}
+                players={players}
+                tournamentSettings={tournamentSettings}
+                onStartTournament={startKnockoutTournament}
+                onResetTournament={handleResetTournament}
+                isAdminMode={isAdminLoggedIn}
+                currentRound={currentRound}
                 selectedTournamentType={selectedTournamentType}
                 onTournamentTypeChange={handleTournamentTypeChange}
                 selectedMatchFormat={selectedMatchFormat}
                 onMatchFormatChange={handleMatchFormatChange}
-                generatedFixtures={state.generatedFixtures}
-                isGeneratingFixture={state.isGeneratingFixture}
+                // Round Robin specific props
+                generatedFixtures={generatedFixtures}
+                isGeneratingFixture={isGeneratingFixture}
                 onGenerateCategoryFixture={handleGenerateCategoryFixture}
                 onDownloadFixture={handleDownloadFixture}
-                onAddFixtureMatchesToTournament={addCategoryFixtureMatchesToTournament}
+                onAddFixtureMatchesToTournament={handleAddFixtureMatchesToTournament}
                 isFixtureActiveForCategory={isFixtureActiveForCategory}
-                onStartRoundRobinTournament={onStartRoundRobinTournament}
+                onStartRoundRobinTournament={handleStartRoundRobinTournament}
                 onGeneratePngFixture={handleGeneratePngFixture}
+                // Hybrid specific props
                 minPlayersPerHybridGroup={minPlayersPerHybridGroup}
                 onMinPlayersPerHybridGroupChange={handleMinPlayersPerHybridGroupChange}
-                generatedHybridGroups={state.generatedHybridGroups}
-                isGeneratingHybridGroups={state.isGeneratingHybridGroups}
+                generatedHybridGroups={generatedHybridGroups}
+                isGeneratingHybridGroups={isGeneratingHybridGroups}
                 onGenerateHybridFixtures={handleGenerateHybridFixtures}
                 onUploadCustomFixture={handleUploadCustomFixture}
-                onAddHybridFixtureMatchesToTournament={onAddHybridFixtureMatchesToTournament}
-                onPublishFixture={handlePublishFixture} // Pass new callback
-                isFixturePublished={isFixturePublished} // Pass new utility
+                // Fix: Corrected prop name to match TournamentSetupProps interface
+                onAddHybridFixtureMatchesToTournamentProp={handleAddHybridFixtureMatchesToTournament}
+                onPublishFixture={handlePublishFixture}
+                isFixturePublished={isFixturePublished}
               />
+            )}
 
-              {state.currentRound > 0 && (
-                <MatchSchedule
-                  matches={state.matches}
-                  players={state.players}
-                  currentRound={state.currentRound}
-                  onUpdateMatchScore={updateMatchScore}
-                  onCompleteRound={completeRound}
-                  isRoundComplete={isRoundComplete}
-                  isTournamentCompleted={isTournamentCompleted}
-                  roundSummary={state.roundSummaries[state.currentRound]}
-                  isLoadingSummary={state.isLoadingSummary}
-                  isAdminMode={state.isAdminLoggedIn}
-                />
-              )}
+            <MatchSchedule
+              matches={matches}
+              players={players}
+              currentRound={currentRound}
+              onUpdateMatchScore={handleUpdateMatchScore}
+              onCompleteRound={handleCompleteRound}
+              isRoundComplete={isCurrentRoundComplete}
+              isTournamentCompleted={isTournamentCompleted}
+              roundSummary={roundSummaries[currentRound]}
+              // Fix: Access isLoadingSummary from tournamentState directly
+              isLoadingSummary={tournamentState.isLoadingSummary}
+              isAdminMode={isAdminLoggedIn && currentMode === 'admin'}
+              publishedFixtures={currentMode === 'user' ? publishedFixtures : undefined} // Only show in user mode
+            />
 
-              <Rankings players={state.players} />
-            </div>
-          </>
-        )}
+            <Rankings players={players} />
 
-        {state.currentMode === 'user' && (
-          <>
-            <div className="md:col-span-1 space-y-4">
-              <PlayerList
-                players={state.players}
-                onAddPlayer={addPlayer} // Not shown in user mode, but still needed for type safety
-                onDeletePlayer={deletePlayer} // Not shown in user mode
-                onUpdatePlayer={updatePlayer} // Not shown in user mode
-                onBulkUploadPlayers={bulkUploadPlayers} // Not shown in user mode
-                isAdminMode={state.isAdminLoggedIn} // Will be false
-                isBulkUploadingPlayers={state.isBulkUploadingPlayers}
+            {showLoginModal && (
+              <LoginModal
+                show={showLoginModal}
+                onClose={() => setShowLoginModal(false)}
+                onLoginSuccess={handleLoginSuccess}
               />
-            </div>
-            <div className="md:col-span-2 space-y-4">
-              {state.currentRound > 0 ? (
-                <MatchSchedule
-                  matches={state.matches}
-                  players={state.players}
-                  currentRound={state.currentRound}
-                  onUpdateMatchScore={updateMatchScore} // Disabled in user mode UI
-                  onCompleteRound={completeRound} // Disabled in user mode UI
-                  isRoundComplete={isRoundComplete}
-                  isTournamentCompleted={isTournamentCompleted}
-                  roundSummary={state.roundSummaries[state.currentRound]}
-                  isLoadingSummary={state.isLoadingSummary}
-                  isAdminMode={state.isAdminLoggedIn} // Will be false
-                />
-              ) : (
-                <MatchSchedule
-                  matches={[]} // No active matches for currentRound 0
-                  players={state.players}
-                  currentRound={0} // Indicate pre-tournament state
-                  onUpdateMatchScore={() => {}} // No-op
-                  onCompleteRound={() => {}} // No-op
-                  isRoundComplete={false}
-                  isTournamentCompleted={false}
-                  isAdminMode={state.isAdminLoggedIn} // Will be false
-                  publishedFixtures={state.publishedFixtures} // Display published fixtures
-                />
-              )}
-              <Rankings players={state.players} />
-            </div>
+            )}
+
+            {showQRScanner && (
+              <QRScanner
+                onScan={handleQRScanSuccess}
+                onClose={handleQRScannerClose}
+              />
+            )}
           </>
         )}
       </main>
-
-      <LoginModal
-        show={showLoginModal}
-        onClose={() => {
-          setShowLoginModal(false);
-          if (!state.isAdminLoggedIn) {
-            // Revert to user mode if login is cancelled and not logged in
-            handleModeChange('user');
-          }
-        }}
-        onLoginSuccess={handleLoginSuccess}
-        validUsername={ADMIN_USERNAME}
-        validPassword={ADMIN_PASSWORD}
-      />
     </div>
   );
 };
